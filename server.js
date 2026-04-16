@@ -59,6 +59,13 @@ async function initDB() {
                 program_start_date DATE NOT NULL,
                 greeting_audio TEXT,
                 greeting_audio_file TEXT,
+                press1_audio_file TEXT,
+                press2_audio_file TEXT,
+                press3_audio_file TEXT,
+                nishmas_audio_file TEXT,
+                all_messages_intro_file TEXT,
+                all_messages_template_file TEXT,
+                return_menu_audio_file TEXT,
                 closing_message TEXT,
                 closing_audio_file TEXT,
                 is_program_active BOOLEAN DEFAULT true,
@@ -74,7 +81,7 @@ async function initDB() {
                 VALUES ($1, $2, $3)
             `, [
                 new Date(), // Start today by default
-                'Welcome to the 40 Days of Nishmas program. Press 1 for today\'s message, press 2 for all previous messages, or press 3 to say Nishmas.',
+                'Welcome to the 40 Days of Nishmas program. Press 1 for today\'s message, press 2 for all previous messages, or press 3 to hear Nishmas.',
                 'Thank you for participating in our 40 Days of Nishmas program. Have a blessed day.'
             ]);
         }
@@ -132,12 +139,10 @@ app.post('/webhook', async (req, res) => {
     try {
         const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
         const settingsData = settings.rows[0];
-        
-        // Get today's message info for personalized greeting
         const todaysMessage = await getMostRecentMessage();
         
         if (settingsData?.greeting_audio_file) {
-            // Use uploaded audio file
+            // Use uploaded complete greeting
             const audioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.greeting_audio_file;
             const gather = twiml.gather({
                 numDigits: 1,
@@ -147,7 +152,7 @@ app.post('/webhook', async (req, res) => {
             });
             gather.play(audioUrl);
         } else {
-            // Generate personalized greeting with speaker name audio
+            // Build greeting from components
             const gather = twiml.gather({
                 numDigits: 1,
                 action: '/handle-menu',
@@ -155,18 +160,39 @@ app.post('/webhook', async (req, res) => {
                 timeout: 10
             });
             
-            gather.say('Welcome to the 40 Days of Nishmas program. Press 1 for today\'s message from');
+            gather.say('Welcome to the 40 Days of Nishmas program.');
             
+            // Press 1 option
+            if (settingsData?.press1_audio_file) {
+                const press1AudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.press1_audio_file;
+                gather.play(press1AudioUrl);
+            } else {
+                gather.say('Press 1 for today\'s message from');
+            }
+            
+            // Speaker name
             if (todaysMessage && todaysMessage.speaker_name_audio) {
-                // Play recorded speaker name
                 const speakerAudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + todaysMessage.speaker_name_audio;
                 gather.play(speakerAudioUrl);
             } else if (todaysMessage && todaysMessage.speaker_name) {
-                // Fallback to text-to-speech
                 gather.say(todaysMessage.speaker_name);
             }
             
-            gather.say(', press 2 for all previous messages, or press 3 to say Nishmas.');
+            // Press 2 option
+            if (settingsData?.press2_audio_file) {
+                const press2AudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.press2_audio_file;
+                gather.play(press2AudioUrl);
+            } else {
+                gather.say('. Press 2 for all previous messages');
+            }
+            
+            // Press 3 option
+            if (settingsData?.press3_audio_file) {
+                const press3AudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.press3_audio_file;
+                gather.play(press3AudioUrl);
+            } else {
+                gather.say(', or press 3 to hear Nishmas.');
+            }
         }
         
         // If no input, repeat the menu
@@ -225,18 +251,35 @@ app.post('/handle-menu', async (req, res) => {
                 break;
                 
             case '2':
-                // All messages menu with recorded speaker names
+                // All messages menu with auto-numbered selection
                 const allMessages = await pool.query(
                     'SELECT * FROM nishmas_messages WHERE is_active = true ORDER BY day_number ASC'
                 );
                 
                 if (allMessages.rows.length > 0) {
-                    twiml.say('Here are all available messages:');
+                    const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+                    const settingsData = settings.rows[0];
                     
-                    // Build dynamic menu with recorded names
-                    allMessages.rows.forEach(msg => {
-                        twiml.say('For');
+                    // Play intro
+                    if (settingsData?.all_messages_intro_file) {
+                        const introAudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.all_messages_intro_file;
+                        twiml.play(introAudioUrl);
+                    } else {
+                        twiml.say('Here are all available messages:');
+                    }
+                    
+                    // Build menu with sequential numbers (1,2,3,4...) not day numbers
+                    allMessages.rows.forEach((msg, index) => {
+                        const selectionNumber = index + 1;
                         
+                        if (settingsData?.all_messages_template_file) {
+                            // Use custom template audio (you'd need to record this dynamically)
+                            twiml.say('Press ' + selectionNumber + ' for');
+                        } else {
+                            twiml.say('Press ' + selectionNumber + ' for');
+                        }
+                        
+                        // Play speaker name
                         if (msg.speaker_name_audio) {
                             const speakerAudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + msg.speaker_name_audio;
                             twiml.play(speakerAudioUrl);
@@ -244,16 +287,22 @@ app.post('/handle-menu', async (req, res) => {
                             twiml.say(msg.speaker_name);
                         }
                         
-                        twiml.say('\'s message from Day ' + msg.day_number + ', press ' + msg.day_number + '.');
+                        twiml.say('\'s message from Day ' + msg.day_number + '.');
                     });
                     
-                    twiml.say('Press 0 to return to the main menu.');
+                    // Return to menu option
+                    if (settingsData?.return_menu_audio_file) {
+                        const returnAudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.return_menu_audio_file;
+                        twiml.play(returnAudioUrl);
+                    } else {
+                        twiml.say('Press 0 to return to the main menu.');
+                    }
                     
                     const gather = twiml.gather({
                         numDigits: 2,
                         action: '/handle-message-selection',
                         method: 'POST',
-                        timeout: 20
+                        timeout: 25
                     });
                     
                 } else {
@@ -263,9 +312,19 @@ app.post('/handle-menu', async (req, res) => {
                 break;
                 
             case '3':
-                // Say Nishmas
-                twiml.say('Thank you for choosing to say Nishmas. Here is a moment for your personal prayer.');
-                twiml.pause({ length: 30 }); // 30 seconds of silence
+                // Play Nishmas audio
+                const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+                const settingsData = settings.rows[0];
+                
+                if (settingsData?.nishmas_audio_file) {
+                    twiml.say('Here is the Nishmas prayer.');
+                    const nishmasAudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.nishmas_audio_file;
+                    twiml.play(nishmasAudioUrl);
+                } else {
+                    twiml.say('Thank you for choosing to say Nishmas. Here is a moment for your personal prayer.');
+                    twiml.pause({ length: 30 }); // 30 seconds of silence as fallback
+                }
+                
                 twiml.say('Thank you for saying Nishmas. May your prayers be answered.');
                 twiml.redirect('/webhook');
                 break;
@@ -284,7 +343,7 @@ app.post('/handle-menu', async (req, res) => {
     res.send(twiml.toString());
 });
 
-// Handle specific message selection
+// Handle specific message selection (using selection numbers, not day numbers)
 app.post('/handle-message-selection', async (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
     const digits = req.body.Digits;
@@ -297,15 +356,20 @@ app.post('/handle-message-selection', async (req, res) => {
             return;
         }
         
-        const dayNumber = parseInt(digits);
-        const message = await pool.query(
-            'SELECT * FROM nishmas_messages WHERE day_number = $1 AND is_active = true',
-            [dayNumber]
+        const selectionNumber = parseInt(digits);
+        
+        // Get messages in same order as menu (by day_number ASC)
+        const allMessages = await pool.query(
+            'SELECT * FROM nishmas_messages WHERE is_active = true ORDER BY day_number ASC'
         );
         
-        if (message.rows.length > 0) {
-            const msg = message.rows[0];
-            twiml.say('Day ' + dayNumber + ' message from');
+        // Convert selection number to actual message (1-based index)
+        const messageIndex = selectionNumber - 1;
+        
+        if (messageIndex >= 0 && messageIndex < allMessages.rows.length) {
+            const msg = allMessages.rows[messageIndex];
+            
+            twiml.say('Day ' + msg.day_number + ' message from');
             
             if (msg.speaker_name_audio) {
                 const speakerAudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + msg.speaker_name_audio;
@@ -425,70 +489,57 @@ app.get('/api/settings', async (req, res) => {
     }
 });
 
-// Update settings API
+// Update settings API with all menu audio files
 app.post('/api/settings', upload.fields([
     { name: 'greeting_audio', maxCount: 1 },
+    { name: 'press1_audio', maxCount: 1 },
+    { name: 'press2_audio', maxCount: 1 },
+    { name: 'press3_audio', maxCount: 1 },
+    { name: 'nishmas_audio', maxCount: 1 },
+    { name: 'all_messages_intro', maxCount: 1 },
+    { name: 'return_menu_audio', maxCount: 1 },
     { name: 'closing_audio', maxCount: 1 }
 ]), async (req, res) => {
     try {
         const { program_start_date, greeting_text, closing_text, is_program_active } = req.body;
         
-        let greeting_audio_file = null;
-        let closing_audio_file = null;
-        
-        if (req.files && req.files.greeting_audio) {
-            greeting_audio_file = req.files.greeting_audio[0].filename;
+        // Get uploaded files
+        const audioFiles = {};
+        if (req.files) {
+            if (req.files.greeting_audio) audioFiles.greeting_audio_file = req.files.greeting_audio[0].filename;
+            if (req.files.press1_audio) audioFiles.press1_audio_file = req.files.press1_audio[0].filename;
+            if (req.files.press2_audio) audioFiles.press2_audio_file = req.files.press2_audio[0].filename;
+            if (req.files.press3_audio) audioFiles.press3_audio_file = req.files.press3_audio[0].filename;
+            if (req.files.nishmas_audio) audioFiles.nishmas_audio_file = req.files.nishmas_audio[0].filename;
+            if (req.files.all_messages_intro) audioFiles.all_messages_intro_file = req.files.all_messages_intro[0].filename;
+            if (req.files.return_menu_audio) audioFiles.return_menu_audio_file = req.files.return_menu_audio[0].filename;
+            if (req.files.closing_audio) audioFiles.closing_audio_file = req.files.closing_audio[0].filename;
         }
         
-        if (req.files && req.files.closing_audio) {
-            closing_audio_file = req.files.closing_audio[0].filename;
-        }
-        
-        // Build update query dynamically based on what's being updated
+        // Build update query dynamically
         let updateQuery = 'UPDATE nishmas_settings SET ';
         let updateParams = [];
         let paramCount = 0;
         
-        if (program_start_date) {
-            paramCount++;
-            updateQuery += 'program_start_date = $' + paramCount + ', ';
-            updateParams.push(program_start_date);
-        }
+        const fieldsToUpdate = {
+            program_start_date,
+            greeting_audio: greeting_text,
+            closing_message: closing_text,
+            is_program_active: is_program_active === 'on' || is_program_active === true,
+            ...audioFiles
+        };
         
-        if (greeting_text !== undefined) {
-            paramCount++;
-            updateQuery += 'greeting_audio = $' + paramCount + ', ';
-            updateParams.push(greeting_text);
-        }
-        
-        if (greeting_audio_file) {
-            paramCount++;
-            updateQuery += 'greeting_audio_file = $' + paramCount + ', ';
-            updateParams.push(greeting_audio_file);
-        }
-        
-        if (closing_text !== undefined) {
-            paramCount++;
-            updateQuery += 'closing_message = $' + paramCount + ', ';
-            updateParams.push(closing_text);
-        }
-        
-        if (closing_audio_file) {
-            paramCount++;
-            updateQuery += 'closing_audio_file = $' + paramCount + ', ';
-            updateParams.push(closing_audio_file);
-        }
-        
-        if (is_program_active !== undefined) {
-            paramCount++;
-            updateQuery += 'is_program_active = $' + paramCount + ', ';
-            updateParams.push(is_program_active === 'on' || is_program_active === true);
-        }
+        Object.entries(fieldsToUpdate).forEach(([key, value]) => {
+            if (value !== undefined) {
+                paramCount++;
+                updateQuery += key + ' = $' + paramCount + ', ';
+                updateParams.push(value);
+            }
+        });
         
         // Remove trailing comma and add WHERE clause
-        updateQuery = updateQuery.slice(0, -2) + ' WHERE id = (SELECT id FROM nishmas_settings LIMIT 1)';
-        
         if (paramCount > 0) {
+            updateQuery = updateQuery.slice(0, -2) + ' WHERE id = (SELECT id FROM nishmas_settings LIMIT 1)';
             await pool.query(updateQuery, updateParams);
         }
         
@@ -499,7 +550,7 @@ app.post('/api/settings', upload.fields([
     }
 });
 
-// PROFESSIONAL ADMIN PANEL WITH SPEAKER NAME AUDIO
+// PROFESSIONAL ADMIN PANEL WITH ALL MENU AUDIO UPLOADS
 app.get('/admin', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -507,7 +558,7 @@ app.get('/admin', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>40 Days of Nishmas - Admin Panel</title>
+    <title>40 Days of Nishmas - Complete Audio Admin</title>
     <style>
         :root {
             --primary: #2c3e50;
@@ -734,11 +785,19 @@ app.get('/admin', (req, res) => {
             margin-bottom: 1rem;
         }
 
-        .speaker-audio-label {
-            font-size: 0.9rem;
+        .menu-audio-section {
+            background: #fff8e1;
+            border: 1px solid #ffeb3b;
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .section-title {
+            font-size: 1.1rem;
             color: var(--accent);
             font-weight: 600;
-            margin-bottom: 0.5rem;
+            margin-bottom: 1rem;
             display: block;
         }
 
@@ -887,6 +946,14 @@ app.get('/admin', (req, res) => {
             margin: 0.5rem 0;
         }
 
+        .current-audio {
+            margin-top: 1rem;
+            padding: 1rem;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid var(--success);
+        }
+
         @media (max-width: 768px) {
             .form-grid {
                 grid-template-columns: 1fr;
@@ -925,7 +992,7 @@ app.get('/admin', (req, res) => {
     <div class="container">
         <div class="header">
             <h1>40 Days of Nishmas</h1>
-            <p>Professional Admin Panel with Speaker Name Audio</p>
+            <p>Complete Audio Control Panel</p>
         </div>
 
         <div class="status-bar">
@@ -940,7 +1007,7 @@ app.get('/admin', (req, res) => {
                 📚 All Messages
             </button>
             <button class="nav-tab" onclick="showTab('settings')" id="tab-settings">
-                ⚙️ Settings
+                ⚙️ Menu Audio
             </button>
         </div>
 
@@ -968,21 +1035,21 @@ app.get('/admin', (req, res) => {
                     </div>
                     
                     <div class="speaker-audio-section">
-                        <label class="speaker-audio-label">🎙️ Speaker Name Audio (2-3 seconds)</label>
+                        <label class="section-title">🎙️ Speaker Name Audio</label>
                         <div class="upload-area" onclick="document.getElementById('speakerAudio').click()">
                             <div class="upload-icon">🗣️</div>
-                            <div class="upload-text">Record & upload speaker name</div>
-                            <div class="upload-subtext">Short clip saying "Rabbi Goldstein" for natural pronunciation</div>
+                            <div class="upload-text">Record speaker name (2-3 seconds)</div>
+                            <div class="upload-subtext">Natural pronunciation for menus</div>
                             <input type="file" id="speakerAudio" name="speaker_audio" accept="audio/*" style="display:none">
                         </div>
                     </div>
                     
                     <div class="form-group">
-                        <label>Message Audio File</label>
+                        <label>Complete Message Audio</label>
                         <div class="upload-area" onclick="document.getElementById('audioFile').click()">
                             <div class="upload-icon">🎵</div>
-                            <div class="upload-text">Upload full message audio</div>
-                            <div class="upload-subtext">Complete daily message MP3/WAV file</div>
+                            <div class="upload-text">Upload full daily message</div>
+                            <div class="upload-subtext">Complete message MP3/WAV file</div>
                             <input type="file" id="audioFile" accept="audio/*" style="display:none">
                         </div>
                     </div>
@@ -1008,7 +1075,7 @@ app.get('/admin', (req, res) => {
         <!-- Settings Tab -->
         <div class="tab-content" id="settings">
             <div class="card">
-                <h2>Program Settings</h2>
+                <h2>Menu Audio Settings</h2>
                 <div id="settings-alert"></div>
                 
                 <form id="settingsForm" enctype="multipart/form-data">
@@ -1017,18 +1084,87 @@ app.get('/admin', (req, res) => {
                         <input type="date" id="startDate" required>
                     </div>
                     
-                    <div class="form-group">
-                        <label>Custom Welcome Message (Audio)</label>
+                    <div class="menu-audio-section">
+                        <label class="section-title">🎤 Complete Welcome Message</label>
                         <div class="upload-area" onclick="document.getElementById('greetingAudio').click()">
                             <div class="upload-icon">📞</div>
-                            <div class="upload-text">Upload welcome greeting</div>
-                            <div class="upload-subtext">This will replace the automated greeting</div>
+                            <div class="upload-text">Upload complete welcome greeting</div>
+                            <div class="upload-subtext">Full opening message (overrides individual components)</div>
                             <input type="file" id="greetingAudio" name="greeting_audio" accept="audio/*" style="display:none">
                         </div>
                         <div id="current-greeting"></div>
                     </div>
+
+                    <div class="menu-audio-section">
+                        <label class="section-title">🔢 Menu Component Audio</label>
+                        
+                        <div class="form-group">
+                            <label>Press 1 Audio</label>
+                            <div class="upload-area" onclick="document.getElementById('press1Audio').click()">
+                                <div class="upload-icon">1️⃣</div>
+                                <div class="upload-text">Upload "Press 1 for today's message from..."</div>
+                                <input type="file" id="press1Audio" name="press1_audio" accept="audio/*" style="display:none">
+                            </div>
+                            <div id="current-press1"></div>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Press 2 Audio</label>
+                            <div class="upload-area" onclick="document.getElementById('press2Audio').click()">
+                                <div class="upload-icon">2️⃣</div>
+                                <div class="upload-text">Upload "Press 2 for all previous messages"</div>
+                                <input type="file" id="press2Audio" name="press2_audio" accept="audio/*" style="display:none">
+                            </div>
+                            <div id="current-press2"></div>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Press 3 Audio</label>
+                            <div class="upload-area" onclick="document.getElementById('press3Audio').click()">
+                                <div class="upload-icon">3️⃣</div>
+                                <div class="upload-text">Upload "Press 3 to hear Nishmas"</div>
+                                <input type="file" id="press3Audio" name="press3_audio" accept="audio/*" style="display:none">
+                            </div>
+                            <div id="current-press3"></div>
+                        </div>
+                    </div>
+
+                    <div class="menu-audio-section">
+                        <label class="section-title">🕊️ Nishmas Prayer Audio</label>
+                        <div class="upload-area" onclick="document.getElementById('nishmasAudio').click()">
+                            <div class="upload-icon">🙏</div>
+                            <div class="upload-text">Upload Nishmas prayer/message</div>
+                            <div class="upload-subtext">Plays when caller presses 3</div>
+                            <input type="file" id="nishmasAudio" name="nishmas_audio" accept="audio/*" style="display:none">
+                        </div>
+                        <div id="current-nishmas"></div>
+                    </div>
+
+                    <div class="menu-audio-section">
+                        <label class="section-title">📋 All Messages Menu Audio</label>
+                        
+                        <div class="form-group">
+                            <label>Menu Intro Audio</label>
+                            <div class="upload-area" onclick="document.getElementById('allMessagesIntro').click()">
+                                <div class="upload-icon">📢</div>
+                                <div class="upload-text">Upload "Here are all available messages"</div>
+                                <input type="file" id="allMessagesIntro" name="all_messages_intro" accept="audio/*" style="display:none">
+                            </div>
+                            <div id="current-all-intro"></div>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Return to Menu Audio</label>
+                            <div class="upload-area" onclick="document.getElementById('returnMenuAudio').click()">
+                                <div class="upload-icon">↩️</div>
+                                <div class="upload-text">Upload "Press 0 to return to main menu"</div>
+                                <input type="file" id="returnMenuAudio" name="return_menu_audio" accept="audio/*" style="display:none">
+                            </div>
+                            <div id="current-return"></div>
+                        </div>
+                    </div>
                     
-                    <button type="submit" class="btn btn-success btn-full">Save Settings</button>
+                    <button type="submit" class="btn btn-success btn-full">Save All Audio Settings</button>
                 </form>
             </div>
         </div>
@@ -1076,17 +1212,29 @@ app.get('/admin', (req, res) => {
                     document.getElementById('startDate').value = currentSettings.program_start_date.split('T')[0];
                 }
                 
-                if (currentSettings.greeting_audio_file) {
-                    document.getElementById('current-greeting').innerHTML = 
-                        '<div style="margin-top: 1rem; padding: 1rem; background: #f8f9fa; border-radius: 8px; border-left: 4px solid var(--success);">' +
-                        '<strong>Current Welcome Message:</strong><br>' +
-                        '<audio controls style="width: 100%; margin-top: 0.5rem;">' +
-                        '<source src="/audio/' + currentSettings.greeting_audio_file + '" type="audio/mpeg">' +
-                        '</audio></div>';
-                }
+                // Show current audio files
+                showCurrentAudio('greeting_audio_file', 'current-greeting', 'Current Welcome Message');
+                showCurrentAudio('press1_audio_file', 'current-press1', 'Current Press 1 Audio');
+                showCurrentAudio('press2_audio_file', 'current-press2', 'Current Press 2 Audio');
+                showCurrentAudio('press3_audio_file', 'current-press3', 'Current Press 3 Audio');
+                showCurrentAudio('nishmas_audio_file', 'current-nishmas', 'Current Nishmas Audio');
+                showCurrentAudio('all_messages_intro_file', 'current-all-intro', 'Current Menu Intro');
+                showCurrentAudio('return_menu_audio_file', 'current-return', 'Current Return Menu Audio');
                 
             } catch (error) {
                 console.error('Error loading settings:', error);
+            }
+        }
+
+        function showCurrentAudio(settingKey, containerId, label) {
+            const container = document.getElementById(containerId);
+            if (currentSettings[settingKey]) {
+                container.innerHTML = 
+                    '<div class="current-audio">' +
+                        '<strong>' + label + ':</strong><br>' +
+                        '<audio controls style="width: 100%; margin-top: 0.5rem;">' +
+                        '<source src="/audio/' + currentSettings[settingKey] + '" type="audio/mpeg">' +
+                        '</audio></div>';
             }
         }
         
@@ -1212,10 +1360,19 @@ app.get('/admin', (req, res) => {
             const formData = new FormData();
             formData.append('program_start_date', document.getElementById('startDate').value);
             
-            const greetingFile = document.getElementById('greetingAudio').files[0];
-            if (greetingFile) {
-                formData.append('greeting_audio', greetingFile);
-            }
+            // Add all audio files
+            const audioInputs = [
+                'greetingAudio', 'press1Audio', 'press2Audio', 'press3Audio', 
+                'nishmasAudio', 'allMessagesIntro', 'returnMenuAudio'
+            ];
+            
+            audioInputs.forEach(inputId => {
+                const file = document.getElementById(inputId).files[0];
+                if (file) {
+                    const fieldName = inputId.replace('Audio', '_audio').replace('greetingAudio', 'greeting_audio');
+                    formData.append(fieldName, file);
+                }
+            });
             
             try {
                 const response = await fetch('/api/settings', {
@@ -1224,7 +1381,7 @@ app.get('/admin', (req, res) => {
                 });
                 
                 if (response.ok) {
-                    showAlert('settings-alert', 'Settings saved successfully', 'success');
+                    showAlert('settings-alert', 'All audio settings saved successfully!', 'success');
                     loadSettings();
                 } else {
                     showAlert('settings-alert', 'Error saving settings', 'error');
@@ -1238,33 +1395,39 @@ app.get('/admin', (req, res) => {
             document.querySelectorAll('.upload-area').forEach(area => {
                 area.classList.remove('has-file');
                 const text = area.querySelector('.upload-text');
-                if (text.textContent.includes('speaker name')) {
-                    text.textContent = 'Record & upload speaker name';
-                } else if (text.textContent.includes('message audio')) {
-                    text.textContent = 'Upload full message audio';
-                } else if (text.textContent.includes('welcome')) {
-                    text.textContent = 'Upload welcome greeting';
-                }
+                const originalText = text.getAttribute('data-original') || text.textContent;
+                text.textContent = originalText;
             });
         }
         
-        // File upload visual feedback
-        document.getElementById('audioFile').addEventListener('change', function(e) {
-            handleFileUpload(e, 'Upload full message audio');
+        // Store original text and handle file uploads
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('.upload-text').forEach(text => {
+                text.setAttribute('data-original', text.textContent);
+            });
         });
         
-        document.getElementById('speakerAudio').addEventListener('change', function(e) {
-            handleFileUpload(e, 'Record & upload speaker name');
+        // File upload handlers
+        const audioInputs = [
+            'audioFile', 'speakerAudio', 'greetingAudio', 'press1Audio', 
+            'press2Audio', 'press3Audio', 'nishmasAudio', 'allMessagesIntro', 'returnMenuAudio'
+        ];
+        
+        audioInputs.forEach(inputId => {
+            const element = document.getElementById(inputId);
+            if (element) {
+                element.addEventListener('change', function(e) {
+                    handleFileUpload(e);
+                });
+            }
         });
         
-        document.getElementById('greetingAudio').addEventListener('change', function(e) {
-            handleFileUpload(e, 'Upload welcome greeting');
-        });
-        
-        function handleFileUpload(e, originalText) {
+        function handleFileUpload(e) {
             const file = e.target.files[0];
-            const area = e.target.closest('.upload-area') || e.target.parentElement;
+            const area = e.target.closest('.upload-area');
             const text = area.querySelector('.upload-text');
+            const originalText = text.getAttribute('data-original');
+            
             if (file) {
                 area.classList.add('has-file');
                 text.textContent = '✓ ' + file.name;
