@@ -44,6 +44,7 @@ async function initDB() {
                 day_number INTEGER UNIQUE NOT NULL,
                 date_recorded DATE NOT NULL,
                 title TEXT NOT NULL,
+                speaker_name TEXT NOT NULL,
                 audio_url TEXT,
                 recorded_audio TEXT,
                 is_active BOOLEAN DEFAULT true,
@@ -131,8 +132,12 @@ app.post('/webhook', async (req, res) => {
         const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
         const settingsData = settings.rows[0];
         
-        // Use audio file if available, otherwise use text greeting
+        // Get today's message info for personalized greeting
+        const todaysMessage = await getMostRecentMessage();
+        let greeting = '';
+        
         if (settingsData?.greeting_audio_file) {
+            // Use uploaded audio file
             const audioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.greeting_audio_file;
             const gather = twiml.gather({
                 numDigits: 1,
@@ -142,7 +147,13 @@ app.post('/webhook', async (req, res) => {
             });
             gather.play(audioUrl);
         } else {
-            const greeting = settingsData?.greeting_audio || 'Welcome to the 40 Days of Nishmas program.';
+            // Generate personalized text greeting
+            if (todaysMessage && todaysMessage.speaker_name) {
+                greeting = 'Welcome to the 40 Days of Nishmas program. Press 1 for today\'s message from ' + todaysMessage.speaker_name + ', press 2 for all previous messages, or press 3 to say Nishmas.';
+            } else {
+                greeting = settingsData?.greeting_audio || 'Welcome to the 40 Days of Nishmas program. Press 1 for today\'s message, press 2 for all previous messages, or press 3 to say Nishmas.';
+            }
+            
             const gather = twiml.gather({
                 numDigits: 1,
                 action: '/handle-menu',
@@ -176,7 +187,7 @@ app.post('/handle-menu', async (req, res) => {
                 // Today's message
                 const todaysMessage = await getMostRecentMessage();
                 if (todaysMessage) {
-                    twiml.say('Here is today\'s message: ' + todaysMessage.title);
+                    twiml.say('Here is today\'s message from ' + todaysMessage.speaker_name + ': ' + todaysMessage.title);
                     
                     if (todaysMessage.audio_url) {
                         twiml.play(todaysMessage.audio_url);
@@ -199,7 +210,7 @@ app.post('/handle-menu', async (req, res) => {
                 break;
                 
             case '2':
-                // All messages menu
+                // All messages menu with personalized speaker names
                 const allMessages = await pool.query(
                     'SELECT * FROM nishmas_messages WHERE is_active = true ORDER BY day_number ASC'
                 );
@@ -207,7 +218,7 @@ app.post('/handle-menu', async (req, res) => {
                 if (allMessages.rows.length > 0) {
                     let menuText = 'Here are all available messages: ';
                     allMessages.rows.forEach(msg => {
-                        menuText += 'Press ' + msg.day_number + ' for day ' + msg.day_number + ': ' + msg.title + '. ';
+                        menuText += 'For ' + msg.speaker_name + '\'s message from Day ' + msg.day_number + ', press ' + msg.day_number + '. ';
                     });
                     menuText += 'Press 0 to return to the main menu.';
                     
@@ -215,7 +226,7 @@ app.post('/handle-menu', async (req, res) => {
                         numDigits: 2,
                         action: '/handle-message-selection',
                         method: 'POST',
-                        timeout: 15
+                        timeout: 20
                     });
                     
                     gather.say(menuText);
@@ -268,7 +279,7 @@ app.post('/handle-message-selection', async (req, res) => {
         
         if (message.rows.length > 0) {
             const msg = message.rows[0];
-            twiml.say('Day ' + dayNumber + ': ' + msg.title);
+            twiml.say('Day ' + dayNumber + ' message from ' + msg.speaker_name + ': ' + msg.title);
             
             if (msg.audio_url) {
                 twiml.play(msg.audio_url);
@@ -313,7 +324,7 @@ app.get('/api/messages', async (req, res) => {
 // Add/update message API
 app.post('/api/messages', upload.single('audio'), async (req, res) => {
     try {
-        const { day_number, title, audio_url } = req.body;
+        const { day_number, title, speaker_name, audio_url } = req.body;
         const recorded_audio = req.file ? req.file.filename : null;
         
         // Check if message for this day already exists
@@ -322,14 +333,14 @@ app.post('/api/messages', upload.single('audio'), async (req, res) => {
         if (existing.rows.length > 0) {
             // Update existing
             await pool.query(
-                'UPDATE nishmas_messages SET title = $2, audio_url = $3, recorded_audio = $4, date_recorded = NOW() WHERE day_number = $1',
-                [day_number, title, audio_url || null, recorded_audio]
+                'UPDATE nishmas_messages SET title = $2, speaker_name = $3, audio_url = $4, recorded_audio = $5, date_recorded = NOW() WHERE day_number = $1',
+                [day_number, title, speaker_name, audio_url || null, recorded_audio]
             );
         } else {
             // Insert new
             await pool.query(
-                'INSERT INTO nishmas_messages (day_number, title, audio_url, recorded_audio, date_recorded) VALUES ($1, $2, $3, $4, NOW())',
-                [day_number, title, audio_url || null, recorded_audio]
+                'INSERT INTO nishmas_messages (day_number, title, speaker_name, audio_url, recorded_audio, date_recorded) VALUES ($1, $2, $3, $4, $5, NOW())',
+                [day_number, title, speaker_name, audio_url || null, recorded_audio]
             );
         }
         
@@ -440,227 +451,519 @@ app.post('/api/settings', upload.fields([
     }
 });
 
-// ULTRA-SIMPLE ADMIN PANEL FOR NON-TECH STAFF
+// PROFESSIONAL ADMIN PANEL
 app.get('/admin', (req, res) => {
     res.send(`
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Nishmas Admin - SUPER SIMPLE</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>40 Days of Nishmas - Admin Panel</title>
     <style>
-        * { box-sizing: border-box; }
-        body { 
-            font-family: Arial, sans-serif; margin: 0; padding: 20px; 
-            background: #f0f0f0; color: #333; font-size: 18px;
+        :root {
+            --primary: #2c3e50;
+            --primary-light: #34495e;
+            --accent: #3498db;
+            --accent-hover: #2980b9;
+            --success: #27ae60;
+            --success-light: #2ecc71;
+            --warning: #f39c12;
+            --danger: #e74c3c;
+            --light: #ecf0f1;
+            --dark: #2c3e50;
+            --border: #bdc3c7;
+            --text: #2c3e50;
+            --text-light: #7f8c8d;
         }
-        .container { max-width: 800px; margin: 0 auto; }
-        
-        /* HUGE, OBVIOUS BUTTONS */
-        .big-button {
-            display: block; width: 100%; padding: 20px; margin: 15px 0;
-            font-size: 24px; font-weight: bold; text-align: center;
-            border: 3px solid #007aff; border-radius: 15px; cursor: pointer;
-            background: white; color: #007aff; text-decoration: none;
-            transition: all 0.3s;
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-        .big-button:hover { background: #007aff; color: white; transform: scale(1.02); }
-        .big-button.active { background: #007aff; color: white; }
-        
-        /* SIMPLE CARD DESIGN */
-        .card { 
-            background: white; padding: 30px; margin: 20px 0; border-radius: 15px;
-            box-shadow: 0 4px 10px rgba(0,0,0,0.1); border: 2px solid #ddd;
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            min-height: 100vh;
+            color: var(--text);
+            line-height: 1.6;
         }
-        .card h1 { margin-top: 0; color: #333; font-size: 28px; text-align: center; }
-        .card h2 { color: #007aff; font-size: 24px; margin-bottom: 20px; }
-        
-        /* FOOLPROOF FORMS */
-        .form-group { margin: 25px 0; }
-        .form-group label { 
-            display: block; margin-bottom: 10px; font-weight: bold; 
-            font-size: 20px; color: #333;
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
         }
-        .form-group input, .form-group textarea, .form-group select {
-            width: 100%; padding: 15px; font-size: 18px; 
-            border: 3px solid #ddd; border-radius: 10px;
+
+        .header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+            color: white;
+            padding: 2rem;
+            border-radius: 12px;
+            margin-bottom: 2rem;
+            text-align: center;
+            box-shadow: 0 8px 32px rgba(44, 62, 80, 0.3);
         }
-        .form-group input:focus, .form-group textarea:focus {
-            border-color: #007aff; outline: none;
+
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            font-weight: 300;
         }
-        
-        /* UPLOAD AREAS THAT SCREAM "CLICK ME!" */
-        .upload-box {
-            border: 5px dashed #007aff; border-radius: 15px; 
-            padding: 40px; text-align: center; cursor: pointer;
-            background: #f8f9ff; margin: 20px 0;
+
+        .header p {
+            opacity: 0.9;
+            font-size: 1.1rem;
         }
-        .upload-box:hover { background: #e6f3ff; }
-        .upload-box .icon { font-size: 48px; margin-bottom: 15px; }
-        .upload-box .text { font-size: 20px; font-weight: bold; color: #007aff; }
-        
-        /* SUPER OBVIOUS SAVE BUTTON */
-        .save-btn {
-            background: #28a745; color: white; border: none; padding: 20px 40px;
-            font-size: 22px; font-weight: bold; border-radius: 15px; cursor: pointer;
-            width: 100%; margin: 20px 0;
+
+        .status-bar {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 12px;
+            margin-bottom: 2rem;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            border-left: 4px solid var(--accent);
         }
-        .save-btn:hover { background: #218838; transform: scale(1.02); }
-        
-        /* CURRENT DAY DISPLAY - SUPER PROMINENT */
-        .current-day { 
-            background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
-            color: white; padding: 30px; text-align: center; border-radius: 15px;
-            font-size: 32px; font-weight: bold; margin: 20px 0;
-            box-shadow: 0 8px 20px rgba(0,0,0,0.2);
+
+        .status-text {
+            font-size: 1.3rem;
+            font-weight: 500;
+            color: var(--primary);
         }
-        
-        /* SIMPLE MESSAGE CARDS */
+
+        .nav-tabs {
+            display: flex;
+            background: white;
+            border-radius: 12px;
+            padding: 8px;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            gap: 4px;
+        }
+
+        .nav-tab {
+            flex: 1;
+            padding: 1rem 2rem;
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 500;
+            color: var(--text-light);
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+
+        .nav-tab:hover {
+            background: var(--light);
+            color: var(--text);
+        }
+
+        .nav-tab.active {
+            background: var(--accent);
+            color: white;
+            box-shadow: 0 2px 8px rgba(52, 152, 219, 0.3);
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            border: 1px solid var(--border);
+        }
+
+        .card h2 {
+            color: var(--primary);
+            margin-bottom: 1.5rem;
+            font-size: 1.8rem;
+            font-weight: 400;
+        }
+
+        .form-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .form-group.full-width {
+            grid-column: 1 / -1;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+            color: var(--primary);
+            font-size: 0.95rem;
+        }
+
+        .form-group input,
+        .form-group textarea,
+        .form-group select {
+            width: 100%;
+            padding: 0.875rem;
+            border: 2px solid var(--border);
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.3s ease;
+            background: white;
+        }
+
+        .form-group input:focus,
+        .form-group textarea:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+        }
+
+        .upload-area {
+            border: 2px dashed var(--border);
+            border-radius: 12px;
+            padding: 2rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: #fafafa;
+        }
+
+        .upload-area:hover {
+            border-color: var(--accent);
+            background: rgba(52, 152, 219, 0.05);
+        }
+
+        .upload-area.has-file {
+            border-color: var(--success);
+            background: rgba(39, 174, 96, 0.05);
+        }
+
+        .upload-icon {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+            color: var(--text-light);
+        }
+
+        .upload-text {
+            font-weight: 500;
+            color: var(--text);
+            margin-bottom: 0.5rem;
+        }
+
+        .upload-subtext {
+            font-size: 0.875rem;
+            color: var(--text-light);
+        }
+
+        .btn {
+            padding: 0.875rem 1.5rem;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            text-decoration: none;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-hover);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(52, 152, 219, 0.3);
+        }
+
+        .btn-success {
+            background: var(--success);
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: var(--success-light);
+        }
+
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #c0392b;
+        }
+
+        .btn-full {
+            width: 100%;
+            justify-content: center;
+        }
+
+        .messages-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 1.5rem;
+            margin-top: 2rem;
+        }
+
         .message-card {
-            border: 3px solid #28a745; border-radius: 15px; padding: 20px; margin: 15px 0;
-            background: #f8fff8;
+            background: white;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.5rem;
+            transition: all 0.3s ease;
         }
-        .message-card h3 { color: #28a745; font-size: 22px; margin: 0 0 10px; }
-        .message-card .day-badge { 
-            background: #28a745; color: white; padding: 8px 15px; 
-            border-radius: 20px; font-weight: bold; display: inline-block; margin-bottom: 10px;
+
+        .message-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 8px 32px rgba(0,0,0,0.15);
         }
-        
-        /* HIDE COMPLEX STUFF */
-        .section { display: none; }
-        .section.active { display: block; }
-        
-        /* AUDIO PLAYERS */
-        audio { width: 100%; margin: 15px 0; }
-        
-        /* SUCCESS/ERROR MESSAGES */
-        .alert { padding: 20px; margin: 20px 0; border-radius: 10px; font-size: 18px; font-weight: bold; }
-        .alert.success { background: #d4edda; color: #155724; border: 2px solid #28a745; }
-        .alert.error { background: #f8d7da; color: #721c24; border: 2px solid #dc3545; }
+
+        .message-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 1rem;
+        }
+
+        .day-badge {
+            background: var(--accent);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-weight: 500;
+            font-size: 0.875rem;
+        }
+
+        .message-title {
+            font-size: 1.1rem;
+            font-weight: 500;
+            color: var(--primary);
+            margin: 0.5rem 0;
+        }
+
+        .speaker-name {
+            color: var(--accent);
+            font-weight: 500;
+            font-size: 0.95rem;
+        }
+
+        .message-date {
+            color: var(--text-light);
+            font-size: 0.875rem;
+        }
+
+        .message-actions {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+
+        .alert {
+            padding: 1rem 1.5rem;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+            font-weight: 500;
+        }
+
+        .alert-success {
+            background: rgba(39, 174, 96, 0.1);
+            color: var(--success);
+            border: 1px solid rgba(39, 174, 96, 0.3);
+        }
+
+        .alert-error {
+            background: rgba(231, 76, 60, 0.1);
+            color: var(--danger);
+            border: 1px solid rgba(231, 76, 60, 0.3);
+        }
+
+        audio {
+            width: 100%;
+            margin: 0.5rem 0;
+        }
+
+        @media (max-width: 768px) {
+            .form-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .nav-tabs {
+                flex-direction: column;
+            }
+
+            .messages-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .header h1 {
+                font-size: 2rem;
+            }
+
+            .message-actions {
+                flex-direction: column;
+            }
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-light);
+        }
+
+        .empty-state-icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="card">
-            <h1>🕊️ Nishmas Admin Panel</h1>
-            <p style="text-align: center; font-size: 20px; color: #666;">
-                Super simple controls for your 40 Days program
-            </p>
+        <div class="header">
+            <h1>40 Days of Nishmas</h1>
+            <p>Professional Admin Panel</p>
         </div>
-        
-        <div class="current-day" id="currentDay">
-            📅 Loading program status...
+
+        <div class="status-bar">
+            <div class="status-text" id="statusText">Loading program status...</div>
         </div>
-        
-        <!-- MAIN NAVIGATION -->
-        <button class="big-button active" onclick="showSection('add-message')" id="btn-add">
-            ➕ ADD TODAY'S MESSAGE
-        </button>
-        <button class="big-button" onclick="showSection('all-messages')" id="btn-all">
-            📝 VIEW ALL MESSAGES
-        </button>
-        <button class="big-button" onclick="showSection('settings')" id="btn-settings">
-            ⚙️ PROGRAM SETTINGS
-        </button>
-        
-        <!-- ADD MESSAGE SECTION -->
-        <div class="section active" id="add-message">
+
+        <div class="nav-tabs">
+            <button class="nav-tab active" onclick="showTab('add-message')" id="tab-add">
+                📝 Add Message
+            </button>
+            <button class="nav-tab" onclick="showTab('messages')" id="tab-messages">
+                📚 All Messages
+            </button>
+            <button class="nav-tab" onclick="showTab('settings')" id="tab-settings">
+                ⚙️ Settings
+            </button>
+        </div>
+
+        <!-- Add Message Tab -->
+        <div class="tab-content active" id="add-message">
             <div class="card">
                 <h2>Add Daily Message</h2>
                 <div id="add-alert"></div>
                 
                 <form id="messageForm" enctype="multipart/form-data">
-                    <div class="form-group">
-                        <label>🗓️ DAY NUMBER (1 to 40)</label>
-                        <input type="number" id="dayNumber" min="1" max="40" value="1" required 
-                               style="font-size: 24px; text-align: center; font-weight: bold;">
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label for="dayNumber">Day Number</label>
+                            <input type="number" id="dayNumber" min="1" max="40" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="speakerName">Speaker Name</label>
+                            <input type="text" id="speakerName" placeholder="e.g., Rabbi Goldstein" required>
+                        </div>
                     </div>
                     
                     <div class="form-group">
-                        <label>📝 MESSAGE TITLE</label>
-                        <input type="text" id="messageTitle" 
-                               placeholder="Example: Day 1 - Introduction to Nishmas" required>
+                        <label for="messageTitle">Message Title</label>
+                        <input type="text" id="messageTitle" placeholder="e.g., Introduction to Nishmas" required>
                     </div>
                     
                     <div class="form-group">
-                        <label>🎵 UPLOAD AUDIO FILE</label>
-                        <div class="upload-box" onclick="document.getElementById('audioFile').click()">
-                            <div class="icon">🎤</div>
-                            <div class="text" id="upload-text">CLICK HERE TO UPLOAD MP3 FILE</div>
+                        <label>Audio File</label>
+                        <div class="upload-area" onclick="document.getElementById('audioFile').click()">
+                            <div class="upload-icon">🎵</div>
+                            <div class="upload-text">Click to upload audio file</div>
+                            <div class="upload-subtext">MP3, WAV files supported</div>
                             <input type="file" id="audioFile" accept="audio/*" style="display:none">
                         </div>
                     </div>
                     
-                    <button type="submit" class="save-btn">💾 SAVE MESSAGE</button>
+                    <button type="submit" class="btn btn-primary btn-full">Save Message</button>
                 </form>
             </div>
         </div>
-        
-        <!-- ALL MESSAGES SECTION -->
-        <div class="section" id="all-messages">
+
+        <!-- Messages Tab -->
+        <div class="tab-content" id="messages">
             <div class="card">
-                <h2>All Your Messages</h2>
-                <div id="messagesContainer">Loading messages...</div>
+                <h2>All Messages</h2>
+                <div class="messages-grid" id="messagesContainer">
+                    <div class="empty-state">
+                        <div class="empty-state-icon">⏳</div>
+                        <p>Loading messages...</p>
+                    </div>
+                </div>
             </div>
         </div>
-        
-        <!-- SETTINGS SECTION -->
-        <div class="section" id="settings">
+
+        <!-- Settings Tab -->
+        <div class="tab-content" id="settings">
             <div class="card">
                 <h2>Program Settings</h2>
                 <div id="settings-alert"></div>
                 
                 <form id="settingsForm" enctype="multipart/form-data">
                     <div class="form-group">
-                        <label>📅 PROGRAM START DATE</label>
-                        <input type="date" id="startDate" required style="font-size: 20px;">
+                        <label for="startDate">Program Start Date</label>
+                        <input type="date" id="startDate" required>
                     </div>
                     
                     <div class="form-group">
-                        <label>🎙️ WELCOME MESSAGE (what callers hear first)</label>
-                        <div class="upload-box" onclick="document.getElementById('greetingAudio').click()">
-                            <div class="icon">📞</div>
-                            <div class="text">UPLOAD WELCOME AUDIO</div>
+                        <label>Custom Welcome Message (Audio)</label>
+                        <div class="upload-area" onclick="document.getElementById('greetingAudio').click()">
+                            <div class="upload-icon">📞</div>
+                            <div class="upload-text">Upload welcome greeting</div>
+                            <div class="upload-subtext">This will replace the automated greeting</div>
                             <input type="file" id="greetingAudio" name="greeting_audio" accept="audio/*" style="display:none">
                         </div>
                         <div id="current-greeting"></div>
                     </div>
                     
-                    <button type="submit" class="save-btn">💾 SAVE SETTINGS</button>
+                    <button type="submit" class="btn btn-success btn-full">Save Settings</button>
                 </form>
             </div>
         </div>
     </div>
-    
+
     <script>
         let currentMessages = [];
         let currentSettings = {};
         
-        // Load data when page starts
         document.addEventListener('DOMContentLoaded', function() {
             loadMessages();
             loadSettings();
-            setTodayAsDefault();
         });
         
-        // Set today's program day as default
-        function setTodayAsDefault() {
-            // This will be updated when settings load
-        }
-        
-        // Show different sections
-        function showSection(sectionName) {
-            // Hide all sections
-            document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-            document.querySelectorAll('.big-button').forEach(b => b.classList.remove('active'));
+        function showTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
             
-            // Show selected section
-            document.getElementById(sectionName).classList.add('active');
-            document.getElementById('btn-' + sectionName.split('-')[0]).classList.add('active');
+            document.getElementById(tabName).classList.add('active');
+            document.getElementById('tab-' + tabName.split('-')[0]).classList.add('active');
         }
         
-        // Load messages
         async function loadMessages() {
             try {
                 const response = await fetch('/api/messages');
@@ -671,31 +974,26 @@ app.get('/admin', (req, res) => {
             }
         }
         
-        // Load settings
         async function loadSettings() {
             try {
                 const response = await fetch('/api/settings');
                 const data = await response.json();
                 currentSettings = data.settings;
                 
-                // Update current day display
-                document.getElementById('currentDay').innerHTML = 
-                    '📅 Today is <strong>Day ' + data.current_program_day + '</strong> of 40';
+                document.getElementById('statusText').innerHTML = 
+                    'Today is <strong>Day ' + data.current_program_day + '</strong> of the 40 Days of Nishmas program';
                 
-                // Set default day number to current day
                 document.getElementById('dayNumber').value = data.current_program_day;
                 
-                // Populate settings form
                 if (currentSettings.program_start_date) {
                     document.getElementById('startDate').value = currentSettings.program_start_date.split('T')[0];
                 }
                 
-                // Show current greeting if exists
                 if (currentSettings.greeting_audio_file) {
                     document.getElementById('current-greeting').innerHTML = 
-                        '<div style="margin-top: 15px; padding: 15px; background: #e8f5e8; border-radius: 10px;">' +
-                        '<strong>✅ Current Welcome Message:</strong><br>' +
-                        '<audio controls style="width: 100%; margin-top: 10px;">' +
+                        '<div style="margin-top: 1rem; padding: 1rem; background: #f8f9fa; border-radius: 8px; border-left: 4px solid var(--success);">' +
+                        '<strong>Current Welcome Message:</strong><br>' +
+                        '<audio controls style="width: 100%; margin-top: 0.5rem;">' +
                         '<source src="/audio/' + currentSettings.greeting_audio_file + '" type="audio/mpeg">' +
                         '</audio></div>';
                 }
@@ -705,43 +1003,88 @@ app.get('/admin', (req, res) => {
             }
         }
         
-        // Display messages in simple format
         function displayMessages() {
             const container = document.getElementById('messagesContainer');
             
             if (currentMessages.length === 0) {
-                container.innerHTML = '<p style="text-align: center; font-size: 20px; color: #666;">No messages yet! Add your first message above.</p>';
+                container.innerHTML = 
+                    '<div class="empty-state">' +
+                        '<div class="empty-state-icon">📝</div>' +
+                        '<p>No messages yet. Add your first message to get started.</p>' +
+                    '</div>';
                 return;
             }
             
             container.innerHTML = currentMessages.map(msg => 
                 '<div class="message-card">' +
-                    '<div class="day-badge">Day ' + msg.day_number + '</div>' +
-                    '<h3>' + msg.title + '</h3>' +
-                    '<p><strong>Added:</strong> ' + new Date(msg.date_recorded).toLocaleDateString() + '</p>' +
+                    '<div class="message-header">' +
+                        '<div class="day-badge">Day ' + msg.day_number + '</div>' +
+                    '</div>' +
+                    '<div class="speaker-name">Speaker: ' + (msg.speaker_name || 'Not specified') + '</div>' +
+                    '<div class="message-title">' + msg.title + '</div>' +
+                    '<div class="message-date">Added: ' + new Date(msg.date_recorded).toLocaleDateString() + '</div>' +
                     (msg.recorded_audio ? 
                         '<audio controls><source src="/audio/' + msg.recorded_audio + '" type="audio/mpeg"></audio>' :
-                        '<p style="color: #orange;">⚠️ No audio file</p>') +
+                        '<p style="color: var(--warning); margin-top: 0.5rem;">⚠️ No audio file</p>') +
+                    '<div class="message-actions">' +
+                        '<button class="btn btn-primary" onclick="editMessage(' + msg.day_number + ')">Edit</button>' +
+                        '<button class="btn btn-danger" onclick="deleteMessage(' + msg.day_number + ')">Delete</button>' +
+                    '</div>' +
                 '</div>'
             ).join('');
         }
         
-        // Handle message form
+        function editMessage(dayNumber) {
+            const message = currentMessages.find(m => m.day_number == dayNumber);
+            if (!message) return;
+            
+            document.getElementById('dayNumber').value = message.day_number;
+            document.getElementById('speakerName').value = message.speaker_name || '';
+            document.getElementById('messageTitle').value = message.title;
+            
+            showTab('add-message');
+        }
+        
+        async function deleteMessage(dayNumber) {
+            if (!confirm('Are you sure you want to delete this message?')) return;
+            
+            try {
+                const response = await fetch('/api/messages/' + dayNumber, { method: 'DELETE' });
+                if (response.ok) {
+                    showAlert('settings-alert', 'Message deleted successfully', 'success');
+                    loadMessages();
+                } else {
+                    showAlert('settings-alert', 'Error deleting message', 'error');
+                }
+            } catch (error) {
+                showAlert('settings-alert', 'Error deleting message', 'error');
+            }
+        }
+        
+        function showAlert(containerId, message, type) {
+            const container = document.getElementById(containerId);
+            container.innerHTML = '<div class="alert alert-' + type + '">' + message + '</div>';
+            setTimeout(() => {
+                container.innerHTML = '';
+            }, 5000);
+        }
+        
         document.getElementById('messageForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             
-            const alertDiv = document.getElementById('add-alert');
             const dayNumber = document.getElementById('dayNumber').value;
+            const speakerName = document.getElementById('speakerName').value;
             const title = document.getElementById('messageTitle').value;
             const audioFile = document.getElementById('audioFile').files[0];
             
             if (!audioFile) {
-                alertDiv.innerHTML = '<div class="alert error">❌ Please upload an audio file!</div>';
+                showAlert('add-alert', 'Please upload an audio file', 'error');
                 return;
             }
             
             const formData = new FormData();
             formData.append('day_number', dayNumber);
+            formData.append('speaker_name', speakerName);
             formData.append('title', title);
             formData.append('audio', audioFile);
             
@@ -752,28 +1095,23 @@ app.get('/admin', (req, res) => {
                 });
                 
                 if (response.ok) {
-                    alertDiv.innerHTML = '<div class="alert success">✅ Message saved successfully!</div>';
+                    showAlert('add-alert', 'Message saved successfully', 'success');
                     document.getElementById('messageForm').reset();
-                    document.getElementById('upload-text').innerHTML = 'CLICK HERE TO UPLOAD MP3 FILE';
+                    updateUploadArea();
                     loadMessages();
-                    
-                    // Auto-increment day number for next message
                     document.getElementById('dayNumber').value = parseInt(dayNumber) + 1;
                 } else {
-                    alertDiv.innerHTML = '<div class="alert error">❌ Error saving message. Try again.</div>';
+                    showAlert('add-alert', 'Error saving message', 'error');
                 }
             } catch (error) {
-                alertDiv.innerHTML = '<div class="alert error">❌ Error saving message. Try again.</div>';
+                showAlert('add-alert', 'Error saving message', 'error');
             }
         });
         
-        // Handle settings form
         document.getElementById('settingsForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             
-            const alertDiv = document.getElementById('settings-alert');
             const formData = new FormData();
-            
             formData.append('program_start_date', document.getElementById('startDate').value);
             
             const greetingFile = document.getElementById('greetingAudio').files[0];
@@ -788,32 +1126,42 @@ app.get('/admin', (req, res) => {
                 });
                 
                 if (response.ok) {
-                    alertDiv.innerHTML = '<div class="alert success">✅ Settings saved successfully!</div>';
-                    loadSettings(); // Reload to show updated info
+                    showAlert('settings-alert', 'Settings saved successfully', 'success');
+                    loadSettings();
                 } else {
-                    alertDiv.innerHTML = '<div class="alert error">❌ Error saving settings. Try again.</div>';
+                    showAlert('settings-alert', 'Error saving settings', 'error');
                 }
             } catch (error) {
-                alertDiv.innerHTML = '<div class="alert error">❌ Error saving settings. Try again.</div>';
+                showAlert('settings-alert', 'Error saving settings', 'error');
             }
         });
         
-        // File upload visual feedback
+        function updateUploadArea() {
+            document.querySelectorAll('.upload-area').forEach(area => {
+                area.classList.remove('has-file');
+                const text = area.querySelector('.upload-text');
+                const icon = area.querySelector('.upload-icon');
+                if (text) text.textContent = 'Click to upload audio file';
+            });
+        }
+        
         document.getElementById('audioFile').addEventListener('change', function(e) {
             const file = e.target.files[0];
-            const uploadText = document.getElementById('upload-text');
+            const area = e.target.closest('.upload-area') || e.target.parentElement;
+            const text = area.querySelector('.upload-text');
             if (file) {
-                uploadText.innerHTML = '✅ SELECTED: ' + file.name;
-                uploadText.style.color = '#28a745';
+                area.classList.add('has-file');
+                text.textContent = '✓ ' + file.name;
             }
         });
         
         document.getElementById('greetingAudio').addEventListener('change', function(e) {
             const file = e.target.files[0];
+            const area = e.target.closest('.upload-area') || e.target.parentElement;
+            const text = area.querySelector('.upload-text');
             if (file) {
-                const box = e.target.parentElement.querySelector('.text');
-                box.innerHTML = '✅ SELECTED: ' + file.name;
-                box.style.color = '#28a745';
+                area.classList.add('has-file');
+                text.textContent = '✓ ' + file.name;
             }
         });
     </script>
