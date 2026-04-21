@@ -142,7 +142,6 @@ app.post('/webhook', async (req, res) => {
         const todaysMessage = await getMostRecentMessage();
         
         if (settingsData?.greeting_audio_file) {
-            // Use uploaded complete greeting
             const audioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.greeting_audio_file;
             const gather = twiml.gather({
                 numDigits: 1,
@@ -152,7 +151,6 @@ app.post('/webhook', async (req, res) => {
             });
             gather.play(audioUrl);
         } else {
-            // Build greeting from components
             const gather = twiml.gather({
                 numDigits: 1,
                 action: '/handle-menu',
@@ -162,7 +160,6 @@ app.post('/webhook', async (req, res) => {
             
             gather.say('Welcome to the 40 Days of Nishmas program.');
             
-            // Press 1 option
             if (settingsData?.press1_audio_file) {
                 const press1AudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.press1_audio_file;
                 gather.play(press1AudioUrl);
@@ -170,7 +167,6 @@ app.post('/webhook', async (req, res) => {
                 gather.say('Press 1 for today\'s message from');
             }
             
-            // Speaker name
             if (todaysMessage && todaysMessage.speaker_name_audio) {
                 const speakerAudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + todaysMessage.speaker_name_audio;
                 gather.play(speakerAudioUrl);
@@ -178,7 +174,6 @@ app.post('/webhook', async (req, res) => {
                 gather.say(todaysMessage.speaker_name);
             }
             
-            // Press 2 option
             if (settingsData?.press2_audio_file) {
                 const press2AudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.press2_audio_file;
                 gather.play(press2AudioUrl);
@@ -186,7 +181,6 @@ app.post('/webhook', async (req, res) => {
                 gather.say('. Press 2 for all previous messages');
             }
             
-            // Press 3 option
             if (settingsData?.press3_audio_file) {
                 const press3AudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.press3_audio_file;
                 gather.play(press3AudioUrl);
@@ -195,7 +189,6 @@ app.post('/webhook', async (req, res) => {
             }
         }
         
-        // If no input, repeat the menu
         twiml.say('We didn\'t receive your selection. Please try again.');
         twiml.redirect('/webhook');
         
@@ -216,7 +209,6 @@ app.post('/handle-menu', async (req, res) => {
     try {
         switch (digit) {
             case '1':
-                // Today's message
                 const todaysMessage = await getMostRecentMessage();
                 if (todaysMessage) {
                     twiml.say('Here is today\'s message from');
@@ -251,7 +243,6 @@ app.post('/handle-menu', async (req, res) => {
                 break;
                 
             case '2':
-                // All messages menu with auto-numbered selection
                 const allMessages = await pool.query(
                     'SELECT * FROM nishmas_messages WHERE is_active = true ORDER BY day_number ASC'
                 );
@@ -260,7 +251,6 @@ app.post('/handle-menu', async (req, res) => {
                     const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
                     const settingsData = settings.rows[0];
                     
-                    // Play intro
                     if (settingsData?.all_messages_intro_file) {
                         const introAudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.all_messages_intro_file;
                         twiml.play(introAudioUrl);
@@ -268,18 +258,10 @@ app.post('/handle-menu', async (req, res) => {
                         twiml.say('Here are all available messages:');
                     }
                     
-                    // Build menu with sequential numbers (1,2,3,4...) not day numbers
                     allMessages.rows.forEach((msg, index) => {
                         const selectionNumber = index + 1;
+                        twiml.say('Press ' + selectionNumber + ' for');
                         
-                        if (settingsData?.all_messages_template_file) {
-                            // Use custom template audio (you'd need to record this dynamically)
-                            twiml.say('Press ' + selectionNumber + ' for');
-                        } else {
-                            twiml.say('Press ' + selectionNumber + ' for');
-                        }
-                        
-                        // Play speaker name
                         if (msg.speaker_name_audio) {
                             const speakerAudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + msg.speaker_name_audio;
                             twiml.play(speakerAudioUrl);
@@ -290,7 +272,6 @@ app.post('/handle-menu', async (req, res) => {
                         twiml.say('\'s message from Day ' + msg.day_number + '.');
                     });
                     
-                    // Return to menu option
                     if (settingsData?.return_menu_audio_file) {
                         const returnAudioUrl = req.protocol + '://' + req.get('host') + '/audio/' + settingsData.return_menu_audio_file;
                         twiml.play(returnAudioUrl);
@@ -298,7 +279,7 @@ app.post('/handle-menu', async (req, res) => {
                         twiml.say('Press 0 to return to the main menu.');
                     }
                     
-                    const gather = twiml.gather({
+                    twiml.gather({
                         numDigits: 2,
                         action: '/handle-message-selection',
                         method: 'POST',
@@ -312,7 +293,6 @@ app.post('/handle-menu', async (req, res) => {
                 break;
                 
             case '3':
-                // Play Nishmas audio
                 const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
                 const settingsData = settings.rows[0];
                 
@@ -322,7 +302,7 @@ app.post('/handle-menu', async (req, res) => {
                     twiml.play(nishmasAudioUrl);
                 } else {
                     twiml.say('Thank you for choosing to say Nishmas. Here is a moment for your personal prayer.');
-                    twiml.pause({ length: 30 }); // 30 seconds of silence as fallback
+                    twiml.pause({ length: 30 });
                 }
                 
                 twiml.say('Thank you for saying Nishmas. May your prayers be answered.');
@@ -343,7 +323,7 @@ app.post('/handle-menu', async (req, res) => {
     res.send(twiml.toString());
 });
 
-// Handle specific message selection (using selection numbers, not day numbers)
+// Handle specific message selection
 app.post('/handle-message-selection', async (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
     const digits = req.body.Digits;
@@ -358,12 +338,10 @@ app.post('/handle-message-selection', async (req, res) => {
         
         const selectionNumber = parseInt(digits);
         
-        // Get messages in same order as menu (by day_number ASC)
         const allMessages = await pool.query(
             'SELECT * FROM nishmas_messages WHERE is_active = true ORDER BY day_number ASC'
         );
         
-        // Convert selection number to actual message (1-based index)
         const messageIndex = selectionNumber - 1;
         
         if (messageIndex >= 0 && messageIndex < allMessages.rows.length) {
@@ -420,7 +398,7 @@ app.get('/api/messages', async (req, res) => {
     }
 });
 
-// Add/update message API with speaker name audio
+// Add/update message API
 app.post('/api/messages', upload.fields([
     { name: 'audio', maxCount: 1 },
     { name: 'speaker_audio', maxCount: 1 }
@@ -439,17 +417,14 @@ app.post('/api/messages', upload.fields([
             speaker_name_audio = req.files.speaker_audio[0].filename;
         }
         
-        // Check if message for this day already exists
         const existing = await pool.query('SELECT id FROM nishmas_messages WHERE day_number = $1', [day_number]);
         
         if (existing.rows.length > 0) {
-            // Update existing
             await pool.query(
                 'UPDATE nishmas_messages SET title = $2, speaker_name = $3, speaker_name_audio = $4, audio_url = $5, recorded_audio = $6, date_recorded = NOW() WHERE day_number = $1',
                 [day_number, title, speaker_name, speaker_name_audio, audio_url || null, recorded_audio]
             );
         } else {
-            // Insert new
             await pool.query(
                 'INSERT INTO nishmas_messages (day_number, title, speaker_name, speaker_name_audio, audio_url, recorded_audio, date_recorded) VALUES ($1, $2, $3, $4, $5, $6, NOW())',
                 [day_number, title, speaker_name, speaker_name_audio, audio_url || null, recorded_audio]
@@ -489,7 +464,7 @@ app.get('/api/settings', async (req, res) => {
     }
 });
 
-// Update settings API with all menu audio files
+// Update settings API
 app.post('/api/settings', upload.fields([
     { name: 'greeting_audio', maxCount: 1 },
     { name: 'press1_audio', maxCount: 1 },
@@ -503,7 +478,6 @@ app.post('/api/settings', upload.fields([
     try {
         const { program_start_date, greeting_text, closing_text, is_program_active } = req.body;
         
-        // Get uploaded files
         const audioFiles = {};
         if (req.files) {
             if (req.files.greeting_audio) audioFiles.greeting_audio_file = req.files.greeting_audio[0].filename;
@@ -516,7 +490,6 @@ app.post('/api/settings', upload.fields([
             if (req.files.closing_audio) audioFiles.closing_audio_file = req.files.closing_audio[0].filename;
         }
         
-        // Build update query dynamically
         let updateQuery = 'UPDATE nishmas_settings SET ';
         let updateParams = [];
         let paramCount = 0;
@@ -537,7 +510,6 @@ app.post('/api/settings', upload.fields([
             }
         });
         
-        // Remove trailing comma and add WHERE clause
         if (paramCount > 0) {
             updateQuery = updateQuery.slice(0, -2) + ' WHERE id = (SELECT id FROM nishmas_settings LIMIT 1)';
             await pool.query(updateQuery, updateParams);
@@ -550,7 +522,7 @@ app.post('/api/settings', upload.fields([
     }
 });
 
-// PROFESSIONAL ADMIN PANEL WITH ALL MENU AUDIO UPLOADS
+// ADMIN PANEL - Bgold-matching dark theme
 app.get('/admin', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -558,22 +530,20 @@ app.get('/admin', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>40 Days of Nishmas - Complete Audio Admin</title>
+    <title>40 Days of Nishmas - Audio Admin</title>
     <style>
         :root {
-            --primary: #2c3e50;
-            --primary-light: #34495e;
-            --accent: #3498db;
-            --accent-hover: #2980b9;
-            --success: #27ae60;
-            --success-light: #2ecc71;
-            --warning: #f39c12;
-            --danger: #e74c3c;
-            --light: #ecf0f1;
-            --dark: #2c3e50;
-            --border: #bdc3c7;
-            --text: #2c3e50;
-            --text-light: #7f8c8d;
+            --bg: #0f1117;
+            --bg2: #1a1d2e;
+            --bg3: #111318;
+            --accent: #d4a017;
+            --accent-hover: #e8a820;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --border: #252a38;
+            --text: #e8eaf0;
+            --text-light: #8b93a8;
         }
 
         * {
@@ -584,7 +554,7 @@ app.get('/admin', (req, res) => {
 
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            background: var(--bg);
             min-height: 100vh;
             color: var(--text);
             line-height: 1.6;
@@ -597,65 +567,73 @@ app.get('/admin', (req, res) => {
         }
 
         .header {
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
-            color: white;
+            background: linear-gradient(135deg, var(--bg2) 0%, var(--border) 100%);
+            color: var(--text);
             padding: 2rem;
             border-radius: 12px;
             margin-bottom: 2rem;
             text-align: center;
-            box-shadow: 0 8px 32px rgba(44, 62, 80, 0.3);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            border: 1px solid var(--border);
         }
 
         .header h1 {
             font-size: 2.5rem;
             margin-bottom: 0.5rem;
-            font-weight: 300;
+            font-weight: 700;
+            color: var(--accent);
         }
 
         .header p {
-            opacity: 0.9;
+            color: var(--text-light);
             font-size: 1.1rem;
         }
 
         .status-bar {
-            background: white;
+            background: var(--bg2);
             padding: 1.5rem;
             border-radius: 12px;
             margin-bottom: 2rem;
             display: flex;
             justify-content: center;
             align-items: center;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            border: 1px solid var(--border);
             border-left: 4px solid var(--accent);
         }
 
         .status-text {
-            font-size: 1.3rem;
+            font-size: 1.2rem;
             font-weight: 500;
-            color: var(--primary);
+            color: var(--text);
+        }
+
+        .status-text strong {
+            color: var(--accent);
         }
 
         .nav-tabs {
             display: flex;
-            background: white;
+            background: var(--bg2);
             border-radius: 12px;
-            padding: 8px;
+            padding: 6px;
             margin-bottom: 2rem;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
             gap: 4px;
+            border: 1px solid var(--border);
         }
 
         .nav-tab {
             flex: 1;
-            padding: 1rem 2rem;
+            padding: .9rem 1.5rem;
             background: transparent;
             border: none;
             border-radius: 8px;
             cursor: pointer;
-            font-size: 1rem;
+            font-size: .95rem;
             font-weight: 500;
             color: var(--text-light);
-            transition: all 0.3s ease;
+            transition: all 0.25s ease;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -663,14 +641,14 @@ app.get('/admin', (req, res) => {
         }
 
         .nav-tab:hover {
-            background: var(--light);
+            background: var(--bg3);
             color: var(--text);
         }
 
         .nav-tab.active {
-            background: var(--accent);
-            color: white;
-            box-shadow: 0 2px 8px rgba(52, 152, 219, 0.3);
+            background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+            color: #000;
+            font-weight: 700;
         }
 
         .tab-content {
@@ -682,19 +660,19 @@ app.get('/admin', (req, res) => {
         }
 
         .card {
-            background: white;
+            background: var(--bg2);
             border-radius: 12px;
             padding: 2rem;
             margin-bottom: 2rem;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
             border: 1px solid var(--border);
         }
 
         .card h2 {
-            color: var(--primary);
+            color: var(--accent);
             margin-bottom: 1.5rem;
-            font-size: 1.8rem;
-            font-weight: 400;
+            font-size: 1.6rem;
+            font-weight: 700;
         }
 
         .form-grid {
@@ -715,21 +693,25 @@ app.get('/admin', (req, res) => {
         .form-group label {
             display: block;
             margin-bottom: 0.5rem;
-            font-weight: 500;
-            color: var(--primary);
-            font-size: 0.95rem;
+            font-weight: 600;
+            color: var(--text-light);
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
         }
 
         .form-group input,
         .form-group textarea,
         .form-group select {
             width: 100%;
-            padding: 0.875rem;
-            border: 2px solid var(--border);
+            padding: 0.75rem;
+            border: 1px solid var(--border);
             border-radius: 8px;
-            font-size: 1rem;
-            transition: border-color 0.3s ease;
-            background: white;
+            font-size: 0.95rem;
+            transition: border-color 0.2s ease;
+            background: var(--bg);
+            color: var(--text);
+            font-family: inherit;
         }
 
         .form-group input:focus,
@@ -737,111 +719,113 @@ app.get('/admin', (req, res) => {
         .form-group select:focus {
             outline: none;
             border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+            box-shadow: 0 0 0 3px rgba(212, 160, 23, 0.15);
         }
 
         .upload-area {
             border: 2px dashed var(--border);
-            border-radius: 12px;
-            padding: 1.5rem;
+            border-radius: 10px;
+            padding: 1.25rem;
             text-align: center;
             cursor: pointer;
-            transition: all 0.3s ease;
-            background: #fafafa;
+            transition: all 0.25s ease;
+            background: var(--bg);
         }
 
         .upload-area:hover {
             border-color: var(--accent);
-            background: rgba(52, 152, 219, 0.05);
+            background: var(--bg3);
         }
 
         .upload-area.has-file {
             border-color: var(--success);
-            background: rgba(39, 174, 96, 0.05);
+            border-style: solid;
+            background: rgba(16, 185, 129, 0.05);
         }
 
         .upload-icon {
-            font-size: 2rem;
-            margin-bottom: 0.5rem;
+            font-size: 1.8rem;
+            margin-bottom: 0.4rem;
             color: var(--text-light);
         }
 
         .upload-text {
             font-weight: 500;
             color: var(--text);
-            margin-bottom: 0.25rem;
+            margin-bottom: 0.2rem;
+            font-size: 0.9rem;
         }
 
         .upload-subtext {
-            font-size: 0.8rem;
+            font-size: 0.78rem;
             color: var(--text-light);
         }
 
         .speaker-audio-section {
-            background: #f8f9ff;
-            border: 1px solid #e1e7ff;
-            border-radius: 8px;
+            background: var(--bg3);
+            border: 1px solid var(--border);
+            border-radius: 10px;
             padding: 1rem;
             margin-bottom: 1rem;
         }
 
         .menu-audio-section {
-            background: #fff8e1;
-            border: 1px solid #ffeb3b;
-            border-radius: 8px;
+            background: var(--bg3);
+            border: 1px solid var(--border);
+            border-radius: 10px;
             padding: 1.5rem;
             margin-bottom: 1rem;
         }
 
         .section-title {
-            font-size: 1.1rem;
+            font-size: 1rem;
             color: var(--accent);
-            font-weight: 600;
+            font-weight: 700;
             margin-bottom: 1rem;
             display: block;
         }
 
         .btn {
-            padding: 0.875rem 1.5rem;
+            padding: 0.75rem 1.5rem;
             border: none;
             border-radius: 8px;
             cursor: pointer;
-            font-size: 1rem;
-            font-weight: 500;
-            transition: all 0.3s ease;
+            font-size: 0.9rem;
+            font-weight: 700;
+            transition: all 0.2s ease;
             display: inline-flex;
             align-items: center;
-            gap: 0.5rem;
+            gap: 0.4rem;
             text-decoration: none;
         }
 
         .btn-primary {
-            background: var(--accent);
-            color: white;
+            background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+            color: #000;
         }
 
         .btn-primary:hover {
-            background: var(--accent-hover);
             transform: translateY(-1px);
-            box-shadow: 0 4px 12px rgba(52, 152, 219, 0.3);
+            box-shadow: 0 4px 12px rgba(212, 160, 23, 0.3);
         }
 
         .btn-success {
             background: var(--success);
-            color: white;
+            color: #000;
         }
 
         .btn-success:hover {
-            background: var(--success-light);
+            background: #34d399;
         }
 
         .btn-danger {
-            background: var(--danger);
-            color: white;
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--danger);
+            border: 1px solid rgba(239, 68, 68, 0.3);
         }
 
         .btn-danger:hover {
-            background: #c0392b;
+            background: rgba(239, 68, 68, 0.25);
         }
 
         .btn-full {
@@ -851,69 +835,71 @@ app.get('/admin', (req, res) => {
 
         .messages-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
             gap: 1.5rem;
             margin-top: 2rem;
         }
 
         .message-card {
-            background: white;
+            background: var(--bg3);
             border: 1px solid var(--border);
             border-radius: 12px;
-            padding: 1.5rem;
-            transition: all 0.3s ease;
+            padding: 1.25rem;
+            transition: all 0.25s ease;
         }
 
         .message-card:hover {
-            transform: translateY(-4px);
-            box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+            transform: translateY(-2px);
+            border-color: var(--accent);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
         }
 
         .message-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            margin-bottom: 1rem;
+            margin-bottom: 0.75rem;
         }
 
         .day-badge {
-            background: var(--accent);
-            color: white;
-            padding: 0.5rem 1rem;
+            background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+            color: #000;
+            padding: 0.35rem 0.9rem;
             border-radius: 20px;
-            font-weight: 500;
-            font-size: 0.875rem;
+            font-weight: 700;
+            font-size: 0.8rem;
         }
 
         .message-title {
-            font-size: 1.1rem;
-            font-weight: 500;
-            color: var(--primary);
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text);
             margin: 0.5rem 0;
         }
 
         .speaker-info {
-            background: #f0f7ff;
+            background: var(--bg);
+            border: 1px solid var(--border);
             border-radius: 6px;
-            padding: 0.5rem;
+            padding: 0.5rem 0.75rem;
             margin: 0.5rem 0;
         }
 
         .speaker-name {
             color: var(--accent);
-            font-weight: 500;
-            font-size: 0.95rem;
+            font-weight: 600;
+            font-size: 0.9rem;
         }
 
         .speaker-audio-indicator {
-            font-size: 0.8rem;
+            font-size: 0.75rem;
             color: var(--success);
-            margin-top: 0.25rem;
+            margin-top: 0.2rem;
         }
 
         .message-date {
             color: var(--text-light);
-            font-size: 0.875rem;
+            font-size: 0.8rem;
         }
 
         .message-actions {
@@ -922,36 +908,52 @@ app.get('/admin', (req, res) => {
             margin-top: 1rem;
         }
 
+        .message-actions .btn {
+            padding: 0.5rem 1rem;
+            font-size: 0.8rem;
+        }
+
         .alert {
-            padding: 1rem 1.5rem;
+            padding: 0.9rem 1.25rem;
             border-radius: 8px;
-            margin-bottom: 1.5rem;
+            margin-bottom: 1.25rem;
             font-weight: 500;
+            font-size: 0.9rem;
         }
 
         .alert-success {
-            background: rgba(39, 174, 96, 0.1);
+            background: rgba(16, 185, 129, 0.1);
             color: var(--success);
-            border: 1px solid rgba(39, 174, 96, 0.3);
+            border: 1px solid rgba(16, 185, 129, 0.3);
         }
 
         .alert-error {
-            background: rgba(231, 76, 60, 0.1);
+            background: rgba(239, 68, 68, 0.1);
             color: var(--danger);
-            border: 1px solid rgba(231, 76, 60, 0.3);
+            border: 1px solid rgba(239, 68, 68, 0.3);
         }
 
         audio {
             width: 100%;
             margin: 0.5rem 0;
+            filter: invert(0.88) hue-rotate(180deg);
         }
 
         .current-audio {
             margin-top: 1rem;
-            padding: 1rem;
-            background: #f8f9fa;
+            padding: 0.9rem;
+            background: var(--bg);
             border-radius: 8px;
             border-left: 4px solid var(--success);
+            border: 1px solid var(--border);
+            border-left-width: 4px;
+        }
+
+        .current-audio strong {
+            color: var(--text-light);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
         }
 
         @media (max-width: 768px) {
@@ -983,16 +985,17 @@ app.get('/admin', (req, res) => {
         }
 
         .empty-state-icon {
-            font-size: 4rem;
+            font-size: 3rem;
             margin-bottom: 1rem;
+            opacity: 0.5;
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>40 Days of Nishmas</h1>
-            <p>Complete Audio Control Panel</p>
+            <h1>🕯️ 40 Days of Nishmas</h1>
+            <p>Audio Control Panel</p>
         </div>
 
         <div class="status-bar">
@@ -1011,7 +1014,6 @@ app.get('/admin', (req, res) => {
             </button>
         </div>
 
-        <!-- Add Message Tab -->
         <div class="tab-content active" id="add-message">
             <div class="card">
                 <h2>Add Daily Message</h2>
@@ -1054,12 +1056,11 @@ app.get('/admin', (req, res) => {
                         </div>
                     </div>
                     
-                    <button type="submit" class="btn btn-primary btn-full">Save Message</button>
+                    <button type="submit" class="btn btn-primary btn-full">💾 Save Message</button>
                 </form>
             </div>
         </div>
 
-        <!-- Messages Tab -->
         <div class="tab-content" id="messages">
             <div class="card">
                 <h2>All Messages</h2>
@@ -1072,7 +1073,6 @@ app.get('/admin', (req, res) => {
             </div>
         </div>
 
-        <!-- Settings Tab -->
         <div class="tab-content" id="settings">
             <div class="card">
                 <h2>Menu Audio Settings</h2>
@@ -1164,7 +1164,7 @@ app.get('/admin', (req, res) => {
                         </div>
                     </div>
                     
-                    <button type="submit" class="btn btn-success btn-full">Save All Audio Settings</button>
+                    <button type="submit" class="btn btn-success btn-full">💾 Save All Audio Settings</button>
                 </form>
             </div>
         </div>
@@ -1212,7 +1212,6 @@ app.get('/admin', (req, res) => {
                     document.getElementById('startDate').value = currentSettings.program_start_date.split('T')[0];
                 }
                 
-                // Show current audio files
                 showCurrentAudio('greeting_audio_file', 'current-greeting', 'Current Welcome Message');
                 showCurrentAudio('press1_audio_file', 'current-press1', 'Current Press 1 Audio');
                 showCurrentAudio('press2_audio_file', 'current-press2', 'Current Press 2 Audio');
@@ -1231,8 +1230,8 @@ app.get('/admin', (req, res) => {
             if (currentSettings[settingKey]) {
                 container.innerHTML = 
                     '<div class="current-audio">' +
-                        '<strong>' + label + ':</strong><br>' +
-                        '<audio controls style="width: 100%; margin-top: 0.5rem;">' +
+                        '<strong>' + label + '</strong><br>' +
+                        '<audio controls>' +
                         '<source src="/audio/' + currentSettings[settingKey] + '" type="audio/mpeg">' +
                         '</audio></div>';
             }
@@ -1259,14 +1258,14 @@ app.get('/admin', (req, res) => {
                         '<div class="speaker-name">Speaker: ' + (msg.speaker_name || 'Not specified') + '</div>' +
                         (msg.speaker_name_audio ? 
                             '<div class="speaker-audio-indicator">✅ Name audio recorded</div>' +
-                            '<audio controls style="width: 100%; margin-top: 0.5rem;"><source src="/audio/' + msg.speaker_name_audio + '" type="audio/mpeg"></audio>' :
-                            '<div style="color: var(--warning); font-size: 0.8rem;">⚠️ No name audio</div>') +
+                            '<audio controls><source src="/audio/' + msg.speaker_name_audio + '" type="audio/mpeg"></audio>' :
+                            '<div style="color: var(--warning); font-size: 0.75rem;">⚠️ No name audio</div>') +
                     '</div>' +
                     '<div class="message-title">' + msg.title + '</div>' +
                     '<div class="message-date">Added: ' + new Date(msg.date_recorded).toLocaleDateString() + '</div>' +
                     (msg.recorded_audio ? 
                         '<audio controls><source src="/audio/' + msg.recorded_audio + '" type="audio/mpeg"></audio>' :
-                        '<p style="color: var(--warning); margin-top: 0.5rem;">⚠️ No message audio</p>') +
+                        '<p style="color: var(--warning); margin-top: 0.5rem; font-size: 0.8rem;">⚠️ No message audio</p>') +
                     '<div class="message-actions">' +
                         '<button class="btn btn-primary" onclick="editMessage(' + msg.day_number + ')">Edit</button>' +
                         '<button class="btn btn-danger" onclick="deleteMessage(' + msg.day_number + ')">Delete</button>' +
@@ -1360,7 +1359,6 @@ app.get('/admin', (req, res) => {
             const formData = new FormData();
             formData.append('program_start_date', document.getElementById('startDate').value);
             
-            // Add all audio files
             const audioInputs = [
                 'greetingAudio', 'press1Audio', 'press2Audio', 'press3Audio', 
                 'nishmasAudio', 'allMessagesIntro', 'returnMenuAudio'
@@ -1400,14 +1398,12 @@ app.get('/admin', (req, res) => {
             });
         }
         
-        // Store original text and handle file uploads
         document.addEventListener('DOMContentLoaded', function() {
             document.querySelectorAll('.upload-text').forEach(text => {
                 text.setAttribute('data-original', text.textContent);
             });
         });
         
-        // File upload handlers
         const audioInputs = [
             'audioFile', 'speakerAudio', 'greetingAudio', 'press1Audio', 
             'press2Audio', 'press3Audio', 'nishmasAudio', 'allMessagesIntro', 'returnMenuAudio'
