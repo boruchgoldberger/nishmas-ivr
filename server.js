@@ -1039,12 +1039,23 @@ app.get('/admin', (req, res) => {
                     <div class="speaker-audio-section">
                         <label class="section-title">🎙️ Speaker Name Audio</label>
                         <div class="upload-area" onclick="document.getElementById('speakerAudio').click()">
-                            <div class="upload-icon">🗣️</div>
-                            <div class="upload-text">Record speaker name (2-3 seconds)</div>
-                            <div class="upload-subtext">Natural pronunciation for menus</div>
+                            <div class="upload-icon">📁</div>
+                            <div class="upload-text">Upload a file</div>
+                            <div class="upload-subtext">MP3 / WAV / M4A — 2-3 seconds</div>
                             <input type="file" id="speakerAudio" name="speaker_audio" accept="audio/*" style="display:none">
                         </div>
-                    </div>
+                        <div style="text-align:center;margin:.75rem 0;color:var(--text-light);font-size:.8rem;">— or —</div>
+                        <div class="record-section" id="speakerRecordSection">
+                            <div style="display:flex;gap:.5rem;align-items:center;justify-content:center;flex-wrap:wrap;">
+                                <button type="button" class="btn btn-primary" id="speakerRecordBtn" onclick="toggleRecord('speaker')">
+                                    <span id="speakerRecordLabel">🎙️ Start Recording</span>
+                                </button>
+                                <span id="speakerRecordTimer" style="display:none;color:var(--danger);font-weight:700;">
+                                    <span class="rec-dot" style="display:inline-block;width:10px;height:10px;background:var(--danger);border-radius:50%;animation:blink 1s infinite;margin-right:6px;"></span>
+                                    <span id="speakerRecordTime">0:00</span>
+                                </span>
+                            </div>
+                            <div id="speakerRecordP
                     
                     <div class="form-group">
                         <label>Complete Message Audio</label>
