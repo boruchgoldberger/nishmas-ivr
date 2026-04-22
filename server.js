@@ -5,6 +5,38 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
+const ffmpeg = require('fluent-ffmpeg');
+
+// Convert any audio file (especially .webm browser recordings) to .mp3 for reliable Twilio playback.
+// Returns the new filename (the .mp3 version). The original .webm is deleted.
+function convertToMp3(inputFilename) {
+    return new Promise((resolve, reject) => {
+        const inputPath = path.join('uploads', inputFilename);
+        const ext = path.extname(inputFilename).toLowerCase();
+        // If already mp3 or wav, keep as-is - Twilio plays those fine
+        if (ext === '.mp3' || ext === '.wav') return resolve(inputFilename);
+        const outputFilename = inputFilename.replace(/\.[^.]+$/, '') + '.mp3';
+        const outputPath = path.join('uploads', outputFilename);
+        ffmpeg(inputPath)
+            .audioCodec('libmp3lame')
+            .audioBitrate('128k')
+            .audioChannels(1)
+            .audioFrequency(22050)
+            .format('mp3')
+            .on('error', (err) => {
+                console.error('[ffmpeg convert ERROR]', err.message);
+                // Fallback: return original filename if conversion fails
+                resolve(inputFilename);
+            })
+            .on('end', () => {
+                console.log('[ffmpeg] converted', inputFilename, '->', outputFilename);
+                // Delete the original (webm etc) to save space
+                fs.unlink(inputPath, () => {});
+                resolve(outputFilename);
+            })
+            .save(outputPath);
+    });
+}
 
 const app = express();
 app.use(express.json());
@@ -271,8 +303,8 @@ app.post('/api/messages', upload.fields([
     try {
         const { day_number, title, speaker_name, audio_url } = req.body;
         let recorded_audio = null, speaker_name_audio = null;
-        if (req.files?.audio) recorded_audio = req.files.audio[0].filename;
-        if (req.files?.speaker_audio) speaker_name_audio = req.files.speaker_audio[0].filename;
+        if (req.files?.audio) recorded_audio = await convertToMp3(req.files.audio[0].filename);
+        if (req.files?.speaker_audio) speaker_name_audio = await convertToMp3(req.files.speaker_audio[0].filename);
         
         const existing = await pool.query('SELECT id FROM nishmas_messages WHERE day_number = $1', [day_number]);
         if (existing.rows.length) {
@@ -324,14 +356,14 @@ app.post('/api/settings', upload.fields([
         const { program_start_date } = req.body;
         const f = {};
         if (req.files) {
-            if (req.files.greeting_audio) f.greeting_audio_file = req.files.greeting_audio[0].filename;
-            if (req.files.press1_audio) f.press1_audio_file = req.files.press1_audio[0].filename;
-            if (req.files.press2_audio) f.press2_audio_file = req.files.press2_audio[0].filename;
-            if (req.files.press3_audio) f.press3_audio_file = req.files.press3_audio[0].filename;
-            if (req.files.nishmas_audio) f.nishmas_audio_file = req.files.nishmas_audio[0].filename;
-            if (req.files.all_messages_intro) f.all_messages_intro_file = req.files.all_messages_intro[0].filename;
-            if (req.files.return_menu_audio) f.return_menu_audio_file = req.files.return_menu_audio[0].filename;
-            if (req.files.closing_audio) f.closing_audio_file = req.files.closing_audio[0].filename;
+            if (req.files.greeting_audio) f.greeting_audio_file = await convertToMp3(req.files.greeting_audio[0].filename);
+            if (req.files.press1_audio) f.press1_audio_file = await convertToMp3(req.files.press1_audio[0].filename);
+            if (req.files.press2_audio) f.press2_audio_file = await convertToMp3(req.files.press2_audio[0].filename);
+            if (req.files.press3_audio) f.press3_audio_file = await convertToMp3(req.files.press3_audio[0].filename);
+            if (req.files.nishmas_audio) f.nishmas_audio_file = await convertToMp3(req.files.nishmas_audio[0].filename);
+            if (req.files.all_messages_intro) f.all_messages_intro_file = await convertToMp3(req.files.all_messages_intro[0].filename);
+            if (req.files.return_menu_audio) f.return_menu_audio_file = await convertToMp3(req.files.return_menu_audio[0].filename);
+            if (req.files.closing_audio) f.closing_audio_file = await convertToMp3(req.files.closing_audio[0].filename);
         }
         const fields = {};
         if (program_start_date) fields.program_start_date = program_start_date;
