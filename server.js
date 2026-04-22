@@ -6,6 +6,11 @@ const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
 const ffmpeg = require('fluent-ffmpeg');
+const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+
+// Point fluent-ffmpeg at the bundled ffmpeg binary (no system install needed)
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+console.log('ffmpeg path set to:', ffmpegInstaller.path);
 
 // Convert any audio file (especially .webm browser recordings) to .mp3 for reliable Twilio playback.
 // Returns the new filename (the .mp3 version). The original .webm is deleted.
