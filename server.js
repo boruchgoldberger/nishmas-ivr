@@ -185,23 +185,32 @@ app.post('/webhook', async (req, res) => {
         const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
         const s = settings.rows[0];
         const todaysMessage = await getMostRecentMessage();
-        
+        const currentDay = await getCurrentProgramDay();
+
+        const gather = twiml.gather({ numDigits: 1, action: '/handle-menu', method: 'POST', timeout: 10 });
+
+        // 1. Welcome greeting (uploaded or TTS default)
         if (s?.greeting_audio_file) {
-            const audioUrl = req.protocol + '://' + req.get('host') + '/audio/' + s.greeting_audio_file;
-            const gather = twiml.gather({ numDigits: 1, action: '/handle-menu', method: 'POST', timeout: 10 });
-            gather.play(audioUrl);
+            gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.greeting_audio_file);
         } else {
-            const gather = twiml.gather({ numDigits: 1, action: '/handle-menu', method: 'POST', timeout: 10 });
             gather.say('Welcome to the 40 Days of Nishmas program.');
-            if (s?.press1_audio_file) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.press1_audio_file);
-            else gather.say("Press 1 for today's message from");
-            if (todaysMessage?.speaker_name_audio) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + todaysMessage.speaker_name_audio);
-            else if (todaysMessage) gather.say(todaysMessage.speaker_name);
-            if (s?.press2_audio_file) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.press2_audio_file);
-            else gather.say('. Press 2 for all previous messages');
-            if (s?.press3_audio_file) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.press3_audio_file);
-            else gather.say(', or press 3 to hear Nishmas.');
         }
+
+        // 2. Auto-generated day announcement (updates daily)
+        if (currentDay >= 1 && currentDay <= 40) {
+            gather.say('Today is day ' + currentDay + ' of Nishmas.');
+        }
+
+        // 3. Press options (uploaded or TTS default)
+        if (s?.press1_audio_file) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.press1_audio_file);
+        else gather.say("Press 1 for today's message from");
+        if (todaysMessage?.speaker_name_audio) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + todaysMessage.speaker_name_audio);
+        else if (todaysMessage) gather.say(todaysMessage.speaker_name);
+        if (s?.press2_audio_file) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.press2_audio_file);
+        else gather.say('. Press 2 for all previous messages');
+        if (s?.press3_audio_file) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.press3_audio_file);
+        else gather.say(', or press 3 to hear Nishmas.');
+
         twiml.say("We didn't receive your selection. Please try again.");
         twiml.redirect('/webhook');
     } catch (error) {
