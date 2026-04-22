@@ -101,7 +101,6 @@ async function getMostRecentMessage() {
     } catch { return null; }
 }
 
-// Main IVR webhook
 app.post('/webhook', async (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
     try {
@@ -225,7 +224,6 @@ app.post('/handle-message-selection', async (req, res) => {
     res.type('text/xml').send(twiml.toString());
 });
 
-// API
 app.get('/api/messages', async (req, res) => {
     const messages = await pool.query('SELECT * FROM nishmas_messages ORDER BY day_number ASC');
     res.json(messages.rows);
@@ -322,10 +320,7 @@ app.delete('/api/settings/audio/:field', async (req, res) => {
     catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ADMIN PANEL
-app.get('/admin', (req, res) => {
-    res.send(ADMIN_HTML);
-});
+app.get('/admin', (req, res) => { res.send(ADMIN_HTML); });
 
 const ADMIN_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -381,6 +376,11 @@ body { font-family: 'Segoe UI', sans-serif; background: var(--bg); min-height: 1
 .record-btn.recording { background: var(--danger); color: #fff; animation: pulse 1.2s infinite; }
 @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,.6); } 50% { box-shadow: 0 0 0 10px rgba(239,68,68,0); } }
 .or-divider { text-align: center; margin: .75rem 0; color: var(--text-light); font-size: .8rem; }
+.recorded-preview { margin-top: .75rem; padding: .9rem; background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 8px; display: none; }
+.recorded-preview.active { display: block; }
+.recorded-preview-label { color: var(--success); font-size: .78rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: .5rem; }
+.recorded-preview-row { display: flex; align-items: center; gap: .5rem; }
+.recorded-preview-row audio { flex: 1; margin: 0; }
 .messages-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 1.5rem; }
 .message-card { background: var(--bg3); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem; }
 .message-card:hover { border-color: var(--accent); }
@@ -452,9 +452,16 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
           </div>
           <div class="or-divider">— or —</div>
           <div class="record-row">
-            <button type="button" class="record-btn" data-target="speakerAudio" data-area="speakerUploadArea">
+            <button type="button" class="record-btn" data-target="speakerAudio" data-area="speakerUploadArea" data-preview="speakerPreview">
               <span class="icon">🎙️</span><span class="label">Record</span>
             </button>
+          </div>
+          <div class="recorded-preview" id="speakerPreview">
+            <div class="recorded-preview-label">✅ Recording ready — listen, then save message or discard</div>
+            <div class="recorded-preview-row">
+              <audio controls></audio>
+              <button type="button" class="delete-icon-btn" data-discard="speakerAudio" data-preview="speakerPreview" data-area="speakerUploadArea" title="Discard recording">🗑️</button>
+            </div>
           </div>
         </div>
         <div class="form-group">
@@ -512,9 +519,16 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
             </div>
             <div class="or-divider">— or —</div>
             <div class="record-row">
-              <button type="button" class="record-btn" data-target="press1Audio" data-area="press1AudioArea">
+              <button type="button" class="record-btn" data-target="press1Audio" data-area="press1AudioArea" data-preview="press1Preview">
                 <span class="icon">🎙️</span><span class="label">Record</span>
               </button>
+            </div>
+            <div class="recorded-preview" id="press1Preview">
+              <div class="recorded-preview-label">✅ Recording ready</div>
+              <div class="recorded-preview-row">
+                <audio controls></audio>
+                <button type="button" class="delete-icon-btn" data-discard="press1Audio" data-preview="press1Preview" data-area="press1AudioArea">🗑️</button>
+              </div>
             </div>
             <div id="current-press1"></div>
           </div>
@@ -528,9 +542,16 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
             </div>
             <div class="or-divider">— or —</div>
             <div class="record-row">
-              <button type="button" class="record-btn" data-target="press2Audio" data-area="press2AudioArea">
+              <button type="button" class="record-btn" data-target="press2Audio" data-area="press2AudioArea" data-preview="press2Preview">
                 <span class="icon">🎙️</span><span class="label">Record</span>
               </button>
+            </div>
+            <div class="recorded-preview" id="press2Preview">
+              <div class="recorded-preview-label">✅ Recording ready</div>
+              <div class="recorded-preview-row">
+                <audio controls></audio>
+                <button type="button" class="delete-icon-btn" data-discard="press2Audio" data-preview="press2Preview" data-area="press2AudioArea">🗑️</button>
+              </div>
             </div>
             <div id="current-press2"></div>
           </div>
@@ -544,9 +565,16 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
             </div>
             <div class="or-divider">— or —</div>
             <div class="record-row">
-              <button type="button" class="record-btn" data-target="press3Audio" data-area="press3AudioArea">
+              <button type="button" class="record-btn" data-target="press3Audio" data-area="press3AudioArea" data-preview="press3Preview">
                 <span class="icon">🎙️</span><span class="label">Record</span>
               </button>
+            </div>
+            <div class="recorded-preview" id="press3Preview">
+              <div class="recorded-preview-label">✅ Recording ready</div>
+              <div class="recorded-preview-row">
+                <audio controls></audio>
+                <button type="button" class="delete-icon-btn" data-discard="press3Audio" data-preview="press3Preview" data-area="press3AudioArea">🗑️</button>
+              </div>
             </div>
             <div id="current-press3"></div>
           </div>
@@ -574,9 +602,16 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
             </div>
             <div class="or-divider">— or —</div>
             <div class="record-row">
-              <button type="button" class="record-btn" data-target="allMessagesIntro" data-area="allMessagesIntroArea">
+              <button type="button" class="record-btn" data-target="allMessagesIntro" data-area="allMessagesIntroArea" data-preview="allIntroPreview">
                 <span class="icon">🎙️</span><span class="label">Record</span>
               </button>
+            </div>
+            <div class="recorded-preview" id="allIntroPreview">
+              <div class="recorded-preview-label">✅ Recording ready</div>
+              <div class="recorded-preview-row">
+                <audio controls></audio>
+                <button type="button" class="delete-icon-btn" data-discard="allMessagesIntro" data-preview="allIntroPreview" data-area="allMessagesIntroArea">🗑️</button>
+              </div>
             </div>
             <div id="current-all-intro"></div>
           </div>
@@ -590,9 +625,16 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
             </div>
             <div class="or-divider">— or —</div>
             <div class="record-row">
-              <button type="button" class="record-btn" data-target="returnMenuAudio" data-area="returnMenuAudioArea">
+              <button type="button" class="record-btn" data-target="returnMenuAudio" data-area="returnMenuAudioArea" data-preview="returnPreview">
                 <span class="icon">🎙️</span><span class="label">Record</span>
               </button>
+            </div>
+            <div class="recorded-preview" id="returnPreview">
+              <div class="recorded-preview-label">✅ Recording ready</div>
+              <div class="recorded-preview-row">
+                <audio controls></audio>
+                <button type="button" class="delete-icon-btn" data-discard="returnMenuAudio" data-preview="returnPreview" data-area="returnMenuAudioArea">🗑️</button>
+              </div>
             </div>
             <div id="current-return"></div>
           </div>
@@ -609,6 +651,7 @@ let currentMessages = [];
 let currentSettings = {};
 let mediaRecorder = null;
 let recordedChunks = [];
+let recordedObjectUrls = {}; // track object URLs to revoke
 
 // ===== TAB SWITCHING =====
 document.querySelectorAll('.nav-tab').forEach(tab => {
@@ -635,6 +678,7 @@ document.querySelectorAll('.record-btn').forEach(btn => {
 
 async function startRecording(btn) {
   const targetId = btn.getAttribute('data-target');
+  const previewId = btn.getAttribute('data-preview');
   const fileInput = document.getElementById(targetId);
 
   try {
@@ -657,6 +701,18 @@ async function startRecording(btn) {
       btn.classList.remove('recording');
       btn.querySelector('.icon').textContent = '🎙️';
       btn.querySelector('.label').textContent = 'Record';
+
+      // Show the preview player
+      const preview = document.getElementById(previewId);
+      if (preview) {
+        const audio = preview.querySelector('audio');
+        // revoke any prior URL to avoid leaks
+        if (recordedObjectUrls[previewId]) URL.revokeObjectURL(recordedObjectUrls[previewId]);
+        const objUrl = URL.createObjectURL(blob);
+        recordedObjectUrls[previewId] = objUrl;
+        audio.src = objUrl;
+        preview.classList.add('active');
+      }
     };
 
     mediaRecorder.start();
@@ -696,6 +752,7 @@ document.querySelectorAll('.upload-area').forEach(area => {
         text.textContent = '✓ ' + (file.name.startsWith('recording-') ? 'Recorded audio attached' : file.name);
       } else {
         area.classList.remove('has-file');
+        // Reset text (reload the data-original or the original label set in HTML)
       }
     });
   }
@@ -781,14 +838,40 @@ function displayMessages() {
   ).join('');
 }
 
-// Event delegation for dynamically rendered buttons
+// Event delegation for dynamically rendered buttons AND discard buttons
 document.addEventListener('click', async (e) => {
-  const action = e.target.getAttribute('data-action');
-  if (!action) return;
+  const target = e.target.closest('[data-action], [data-discard]');
+  if (!target) return;
+
+  const action = target.getAttribute('data-action');
+  const discard = target.getAttribute('data-discard');
+
+  if (discard) {
+    e.preventDefault();
+    // Clear the file input and hide the preview
+    const fileInput = document.getElementById(discard);
+    if (fileInput) fileInput.value = '';
+    const previewId = target.getAttribute('data-preview');
+    const areaId = target.getAttribute('data-area');
+    const preview = document.getElementById(previewId);
+    if (preview) {
+      const audio = preview.querySelector('audio');
+      if (audio) audio.src = '';
+      preview.classList.remove('active');
+    }
+    if (recordedObjectUrls[previewId]) {
+      URL.revokeObjectURL(recordedObjectUrls[previewId]);
+      delete recordedObjectUrls[previewId];
+    }
+    const area = document.getElementById(areaId);
+    if (area) area.classList.remove('has-file');
+    return;
+  }
+
   e.preventDefault();
 
   if (action === 'edit') {
-    const day = e.target.getAttribute('data-day');
+    const day = target.getAttribute('data-day');
     const m = currentMessages.find(x => x.day_number == day);
     if (!m) return;
     document.getElementById('dayNumber').value = m.day_number;
@@ -796,19 +879,19 @@ document.addEventListener('click', async (e) => {
     document.getElementById('messageTitle').value = m.title;
     document.querySelector('.nav-tab[data-tab="add-message"]').click();
   } else if (action === 'delete') {
-    const day = e.target.getAttribute('data-day');
+    const day = target.getAttribute('data-day');
     if (!confirm('Delete this message?')) return;
     const r = await fetch('/api/messages/' + day, { method: 'DELETE' });
     if (r.ok) { showAlert('settings-alert', 'Deleted', 'success'); loadMessages(); }
     else showAlert('settings-alert', 'Error deleting', 'error');
   } else if (action === 'delete-speaker-audio') {
-    const day = e.target.getAttribute('data-day');
+    const day = target.getAttribute('data-day');
     if (!confirm('Delete speaker audio for Day ' + day + '?')) return;
     const r = await fetch('/api/messages/' + day + '/speaker-audio', { method: 'DELETE' });
     if (r.ok) { showAlert('add-alert', 'Speaker audio deleted', 'success'); loadMessages(); }
     else showAlert('add-alert', 'Error deleting', 'error');
   } else if (action === 'delete-settings-audio') {
-    const field = e.target.getAttribute('data-field');
+    const field = target.getAttribute('data-field');
     if (!confirm('Delete this audio?')) return;
     const r = await fetch('/api/settings/audio/' + field, { method: 'DELETE' });
     if (r.ok) { showAlert('settings-alert', 'Audio deleted', 'success'); loadSettings(); }
@@ -822,7 +905,6 @@ function showAlert(containerId, message, type) {
   setTimeout(() => { c.innerHTML = ''; }, 5000);
 }
 
-// ===== FORM SUBMIT =====
 document.getElementById('messageForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData();
@@ -840,6 +922,7 @@ document.getElementById('messageForm').addEventListener('submit', async (e) => {
       showAlert('add-alert', 'Message saved', 'success');
       document.getElementById('messageForm').reset();
       document.querySelectorAll('.upload-area').forEach(a => a.classList.remove('has-file'));
+      document.querySelectorAll('.recorded-preview').forEach(p => p.classList.remove('active'));
       loadMessages();
     } else {
       showAlert('add-alert', 'Error saving', 'error');
@@ -865,7 +948,11 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
   });
   try {
     const r = await fetch('/api/settings', { method: 'POST', body: fd });
-    if (r.ok) { showAlert('settings-alert', 'Settings saved!', 'success'); loadSettings(); }
+    if (r.ok) {
+      showAlert('settings-alert', 'Settings saved!', 'success');
+      document.querySelectorAll('.recorded-preview').forEach(p => p.classList.remove('active'));
+      loadSettings();
+    }
     else showAlert('settings-alert', 'Error saving', 'error');
   } catch (err) { showAlert('settings-alert', 'Error: ' + err.message, 'error'); }
 });
