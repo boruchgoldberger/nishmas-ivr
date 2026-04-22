@@ -93,6 +93,9 @@ async function initDB() {
                 press2_audio_file TEXT,
                 press3_audio_file TEXT,
                 nishmas_audio_file TEXT,
+                nishmas_ashkenaz_file TEXT,
+                nishmas_mizrach_file TEXT,
+                nishmas_nusach_prompt_file TEXT,
                 all_messages_intro_file TEXT,
                 all_messages_template_file TEXT,
                 return_menu_audio_file TEXT,
@@ -126,6 +129,9 @@ async function initDB() {
             ['press2_audio_file', 'TEXT'],
             ['press3_audio_file', 'TEXT'],
             ['nishmas_audio_file', 'TEXT'],
+            ['nishmas_ashkenaz_file', 'TEXT'],
+            ['nishmas_mizrach_file', 'TEXT'],
+            ['nishmas_nusach_prompt_file', 'TEXT'],
             ['all_messages_intro_file', 'TEXT'],
             ['all_messages_template_file', 'TEXT'],
             ['return_menu_audio_file', 'TEXT'],
@@ -245,15 +251,23 @@ app.post('/handle-menu', async (req, res) => {
         } else if (digit === '3') {
             const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
             const s = settings.rows[0];
-            if (s?.nishmas_audio_file) {
+            // If only legacy single file exists (no nusach versions), play it directly (backwards compat)
+            if (s?.nishmas_audio_file && !s?.nishmas_ashkenaz_file && !s?.nishmas_mizrach_file) {
                 twiml.say('Here is the Nishmas prayer.');
                 twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + s.nishmas_audio_file);
+                twiml.say('Thank you for saying Nishmas.');
+                twiml.redirect('/webhook');
             } else {
-                twiml.say('Here is a moment for your personal prayer.');
-                twiml.pause({ length: 30 });
+                // Nusach selection sub-menu
+                const gather = twiml.gather({ numDigits: 1, action: '/handle-nusach-selection', method: 'POST', timeout: 10 });
+                if (s?.nishmas_nusach_prompt_file) {
+                    gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.nishmas_nusach_prompt_file);
+                } else {
+                    gather.say('Press 1 for Ashkenaz or Sfard. Press 2 for Eidot HaMizrach.');
+                }
+                twiml.say("We didn't receive your selection.");
+                twiml.redirect('/webhook');
             }
-            twiml.say('Thank you for saying Nishmas.');
-            twiml.redirect('/webhook');
         } else {
             twiml.say('Invalid selection.');
             twiml.redirect('/webhook');
@@ -261,6 +275,34 @@ app.post('/handle-menu', async (req, res) => {
     } catch (error) {
         console.error(error);
         twiml.say("Technical difficulties.");
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Handle nusach selection (from press-3 menu)
+app.post('/handle-nusach-selection', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    const digit = req.body.Digits;
+    try {
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0];
+        let audioFile = null;
+        if (digit === '1') {
+            audioFile = s?.nishmas_ashkenaz_file || s?.nishmas_audio_file;
+        } else if (digit === '2') {
+            audioFile = s?.nishmas_mizrach_file || s?.nishmas_audio_file;
+        }
+        if (audioFile) {
+            twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + audioFile);
+            twiml.say('Thank you for saying Nishmas.');
+        } else {
+            twiml.say('That version is not available yet. Returning to the main menu.');
+        }
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error(e);
+        twiml.say('Error. Returning to main menu.');
         twiml.redirect('/webhook');
     }
     res.type('text/xml').send(twiml.toString());
@@ -353,6 +395,9 @@ app.post('/api/settings', upload.fields([
     { name: 'press2_audio', maxCount: 1 },
     { name: 'press3_audio', maxCount: 1 },
     { name: 'nishmas_audio', maxCount: 1 },
+    { name: 'nishmas_ashkenaz', maxCount: 1 },
+    { name: 'nishmas_mizrach', maxCount: 1 },
+    { name: 'nishmas_nusach_prompt', maxCount: 1 },
     { name: 'all_messages_intro', maxCount: 1 },
     { name: 'return_menu_audio', maxCount: 1 },
     { name: 'closing_audio', maxCount: 1 }
@@ -366,6 +411,9 @@ app.post('/api/settings', upload.fields([
             if (req.files.press2_audio) f.press2_audio_file = await convertToMp3(req.files.press2_audio[0].filename);
             if (req.files.press3_audio) f.press3_audio_file = await convertToMp3(req.files.press3_audio[0].filename);
             if (req.files.nishmas_audio) f.nishmas_audio_file = await convertToMp3(req.files.nishmas_audio[0].filename);
+            if (req.files.nishmas_ashkenaz) f.nishmas_ashkenaz_file = await convertToMp3(req.files.nishmas_ashkenaz[0].filename);
+            if (req.files.nishmas_mizrach) f.nishmas_mizrach_file = await convertToMp3(req.files.nishmas_mizrach[0].filename);
+            if (req.files.nishmas_nusach_prompt) f.nishmas_nusach_prompt_file = await convertToMp3(req.files.nishmas_nusach_prompt[0].filename);
             if (req.files.all_messages_intro) f.all_messages_intro_file = await convertToMp3(req.files.all_messages_intro[0].filename);
             if (req.files.return_menu_audio) f.return_menu_audio_file = await convertToMp3(req.files.return_menu_audio[0].filename);
             if (req.files.closing_audio) f.closing_audio_file = await convertToMp3(req.files.closing_audio[0].filename);
@@ -385,7 +433,8 @@ app.post('/api/settings', upload.fields([
 
 app.delete('/api/settings/audio/:field', async (req, res) => {
     const allowed = ['greeting_audio_file','press1_audio_file','press2_audio_file','press3_audio_file',
-                     'nishmas_audio_file','all_messages_intro_file','return_menu_audio_file','closing_audio_file'];
+                     'nishmas_audio_file','nishmas_ashkenaz_file','nishmas_mizrach_file','nishmas_nusach_prompt_file',
+                     'all_messages_intro_file','return_menu_audio_file','closing_audio_file'];
     const field = req.params.field;
     if (!allowed.includes(field)) return res.status(400).json({ error: 'Invalid field' });
     try { await pool.query('UPDATE nishmas_settings SET ' + field + ' = NULL WHERE id = (SELECT id FROM nishmas_settings LIMIT 1)'); res.json({ success: true }); }
@@ -544,6 +593,19 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
             <div class="upload-subtext">MP3/WAV file</div>
             <input type="file" id="audioFile" accept="audio/*" style="display:none">
           </div>
+          <div class="or-divider">— or —</div>
+          <div class="record-row">
+            <button type="button" class="record-btn" data-target="audioFile" data-area="audioFileArea" data-preview="audioFilePreview">
+              <span class="icon">🎙️</span><span class="label">Record</span>
+            </button>
+          </div>
+          <div class="recorded-preview" id="audioFilePreview">
+            <div class="recorded-preview-label">✅ Recording ready — listen, then save or discard</div>
+            <div class="recorded-preview-row">
+              <audio controls></audio>
+              <button type="button" class="delete-icon-btn" data-discard="audioFile" data-preview="audioFilePreview" data-area="audioFileArea">🗑️</button>
+            </div>
+          </div>
         </div>
         <button type="submit" class="btn btn-primary btn-full">💾 Save Message</button>
       </form>
@@ -575,6 +637,19 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
             <div class="upload-icon">📞</div>
             <div class="upload-text">Upload complete welcome greeting</div>
             <input type="file" id="greetingAudio" name="greeting_audio" accept="audio/*" style="display:none">
+          </div>
+          <div class="or-divider">— or —</div>
+          <div class="record-row">
+            <button type="button" class="record-btn" data-target="greetingAudio" data-area="greetingAudioArea" data-preview="greetingPreview">
+              <span class="icon">🎙️</span><span class="label">Record</span>
+            </button>
+          </div>
+          <div class="recorded-preview" id="greetingPreview">
+            <div class="recorded-preview-label">✅ Recording ready — listen, then save or discard</div>
+            <div class="recorded-preview-row">
+              <audio controls></audio>
+              <button type="button" class="delete-icon-btn" data-discard="greetingAudio" data-preview="greetingPreview" data-area="greetingAudioArea">🗑️</button>
+            </div>
           </div>
           <div id="current-greeting"></div>
         </div>
@@ -653,13 +728,77 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
         </div>
 
         <div class="menu-audio-section">
-          <label class="section-title">🕊️ Nishmas Prayer Audio</label>
-          <div class="upload-area" id="nishmasAudioArea">
-            <div class="upload-icon">🙏</div>
-            <div class="upload-text">Upload Nishmas prayer</div>
-            <input type="file" id="nishmasAudio" name="nishmas_audio" accept="audio/*" style="display:none">
+          <label class="section-title">🕊️ Nishmas Prayer (by Nusach)</label>
+          <p style="color:var(--text-light);font-size:.82rem;margin-bottom:1rem;">When a caller presses 3 on the main menu, they'll be asked to choose a nusach.</p>
+
+          <div class="form-group">
+            <label>🇦 Ashkenaz / Sfard</label>
+            <div class="upload-area" id="nishmasAshkenazArea">
+              <div class="upload-icon">🙏</div>
+              <div class="upload-text">Upload Ashkenaz/Sfard Nishmas</div>
+              <input type="file" id="nishmasAshkenaz" name="nishmas_ashkenaz" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row">
+              <button type="button" class="record-btn" data-target="nishmasAshkenaz" data-area="nishmasAshkenazArea" data-preview="nishmasAshkenazPreview">
+                <span class="icon">🎙️</span><span class="label">Record</span>
+              </button>
+            </div>
+            <div class="recorded-preview" id="nishmasAshkenazPreview">
+              <div class="recorded-preview-label">✅ Recording ready</div>
+              <div class="recorded-preview-row">
+                <audio controls></audio>
+                <button type="button" class="delete-icon-btn" data-discard="nishmasAshkenaz" data-preview="nishmasAshkenazPreview" data-area="nishmasAshkenazArea">🗑️</button>
+              </div>
+            </div>
+            <div id="current-nishmas-ashkenaz"></div>
           </div>
-          <div id="current-nishmas"></div>
+
+          <div class="form-group">
+            <label>🇲 Eidot HaMizrach</label>
+            <div class="upload-area" id="nishmasMizrachArea">
+              <div class="upload-icon">🙏</div>
+              <div class="upload-text">Upload Eidot HaMizrach Nishmas</div>
+              <input type="file" id="nishmasMizrach" name="nishmas_mizrach" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row">
+              <button type="button" class="record-btn" data-target="nishmasMizrach" data-area="nishmasMizrachArea" data-preview="nishmasMizrachPreview">
+                <span class="icon">🎙️</span><span class="label">Record</span>
+              </button>
+            </div>
+            <div class="recorded-preview" id="nishmasMizrachPreview">
+              <div class="recorded-preview-label">✅ Recording ready</div>
+              <div class="recorded-preview-row">
+                <audio controls></audio>
+                <button type="button" class="delete-icon-btn" data-discard="nishmasMizrach" data-preview="nishmasMizrachPreview" data-area="nishmasMizrachArea">🗑️</button>
+              </div>
+            </div>
+            <div id="current-nishmas-mizrach"></div>
+          </div>
+
+          <div class="form-group">
+            <label>Nusach Selection Prompt (optional — otherwise uses robot voice)</label>
+            <div class="upload-area" id="nishmasNusachPromptArea">
+              <div class="upload-icon">🔢</div>
+              <div class="upload-text">Upload "Press 1 for Ashkenaz or Sfard, Press 2 for Eidot HaMizrach"</div>
+              <input type="file" id="nishmasNusachPrompt" name="nishmas_nusach_prompt" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row">
+              <button type="button" class="record-btn" data-target="nishmasNusachPrompt" data-area="nishmasNusachPromptArea" data-preview="nishmasNusachPromptPreview">
+                <span class="icon">🎙️</span><span class="label">Record</span>
+              </button>
+            </div>
+            <div class="recorded-preview" id="nishmasNusachPromptPreview">
+              <div class="recorded-preview-label">✅ Recording ready</div>
+              <div class="recorded-preview-row">
+                <audio controls></audio>
+                <button type="button" class="delete-icon-btn" data-discard="nishmasNusachPrompt" data-preview="nishmasNusachPromptPreview" data-area="nishmasNusachPromptArea">🗑️</button>
+              </div>
+            </div>
+            <div id="current-nishmas-nusach-prompt"></div>
+          </div>
         </div>
 
         <div class="menu-audio-section">
@@ -810,7 +949,7 @@ document.querySelectorAll('.upload-area').forEach(area => {
   });
 });
 
-['audioFile', 'speakerAudio', 'greetingAudio', 'press1Audio', 'press2Audio', 'press3Audio', 'nishmasAudio', 'allMessagesIntro', 'returnMenuAudio'].forEach(inputId => {
+['audioFile', 'speakerAudio', 'greetingAudio', 'press1Audio', 'press2Audio', 'press3Audio', 'nishmasAshkenaz', 'nishmasMizrach', 'nishmasNusachPrompt', 'allMessagesIntro', 'returnMenuAudio'].forEach(inputId => {
   const el = document.getElementById(inputId);
   if (el) {
     el.addEventListener('change', (e) => {
@@ -856,7 +995,9 @@ async function loadSettings() {
     showCurrentAudio('press1_audio_file', 'current-press1', 'Current Press 1 Audio');
     showCurrentAudio('press2_audio_file', 'current-press2', 'Current Press 2 Audio');
     showCurrentAudio('press3_audio_file', 'current-press3', 'Current Press 3 Audio');
-    showCurrentAudio('nishmas_audio_file', 'current-nishmas', 'Current Nishmas Audio');
+    showCurrentAudio('nishmas_ashkenaz_file', 'current-nishmas-ashkenaz', 'Current Ashkenaz/Sfard Nishmas');
+    showCurrentAudio('nishmas_mizrach_file', 'current-nishmas-mizrach', 'Current Eidot HaMizrach Nishmas');
+    showCurrentAudio('nishmas_nusach_prompt_file', 'current-nishmas-nusach-prompt', 'Current Nusach Selection Prompt');
     showCurrentAudio('all_messages_intro_file', 'current-all-intro', 'Current Menu Intro');
     showCurrentAudio('return_menu_audio_file', 'current-return', 'Current Return Menu Audio');
   } catch (e) { console.error(e); }
@@ -1011,11 +1152,15 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     ['press1Audio', 'press1_audio'],
     ['press2Audio', 'press2_audio'],
     ['press3Audio', 'press3_audio'],
-    ['nishmasAudio', 'nishmas_audio'],
+    ['nishmasAshkenaz', 'nishmas_ashkenaz'],
+    ['nishmasMizrach', 'nishmas_mizrach'],
+    ['nishmasNusachPrompt', 'nishmas_nusach_prompt'],
     ['allMessagesIntro', 'all_messages_intro'],
     ['returnMenuAudio', 'return_menu_audio']
   ].forEach(([inputId, fieldName]) => {
-    const f = document.getElementById(inputId).files[0];
+    const el = document.getElementById(inputId);
+    if (!el) return;
+    const f = el.files[0];
     if (f) fd.append(fieldName, f);
   });
   try {
