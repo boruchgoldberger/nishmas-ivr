@@ -66,6 +66,41 @@ async function initDB() {
             );
         `);
         
+        // Auto-heal: add any missing columns to nishmas_messages (in case table was created earlier with a different schema)
+        const msgCols = [
+            ['title', 'TEXT'],
+            ['speaker_name', 'TEXT'],
+            ['speaker_name_audio', 'TEXT'],
+            ['audio_url', 'TEXT'],
+            ['recorded_audio', 'TEXT'],
+            ['date_recorded', 'DATE'],
+            ['is_active', 'BOOLEAN DEFAULT true'],
+            ['created_at', 'TIMESTAMP DEFAULT NOW()']
+        ];
+        for (const [col, type] of msgCols) {
+            await pool.query(`ALTER TABLE nishmas_messages ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
+        }
+        // Auto-heal nishmas_settings too
+        const setCols = [
+            ['program_start_date', 'DATE'],
+            ['greeting_audio', 'TEXT'],
+            ['greeting_audio_file', 'TEXT'],
+            ['press1_audio_file', 'TEXT'],
+            ['press2_audio_file', 'TEXT'],
+            ['press3_audio_file', 'TEXT'],
+            ['nishmas_audio_file', 'TEXT'],
+            ['all_messages_intro_file', 'TEXT'],
+            ['all_messages_template_file', 'TEXT'],
+            ['return_menu_audio_file', 'TEXT'],
+            ['closing_message', 'TEXT'],
+            ['closing_audio_file', 'TEXT'],
+            ['is_program_active', 'BOOLEAN DEFAULT true'],
+            ['created_at', 'TIMESTAMP DEFAULT NOW()']
+        ];
+        for (const [col, type] of setCols) {
+            await pool.query(`ALTER TABLE nishmas_settings ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
+        }
+
         const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
         if (settings.rows.length === 0) {
             await pool.query(`
@@ -73,7 +108,7 @@ async function initDB() {
                 VALUES ($1, $2, $3)
             `, [new Date(), 'Welcome.', 'Thank you.']);
         }
-        console.log('Database initialized');
+        console.log('Database initialized (schema healed)');
     } catch (error) {
         console.error('Database init error:', error);
     }
