@@ -161,9 +161,12 @@ async function getCurrentProgramDay() {
     try {
         const settings = await pool.query('SELECT program_start_date FROM nishmas_settings LIMIT 1');
         if (!settings.rows.length) return 1;
-        const startDate = new Date(settings.rows[0].program_start_date);
-        const today = new Date();
-        const diffDays = Math.ceil((today - startDate) / (1000 * 60 * 60 * 24));
+        // Normalize to date-only (strip time) so partial-day clock differences don't shift the count
+        const start = new Date(settings.rows[0].program_start_date);
+        const startOfStart = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+        const now = new Date();
+        const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const diffDays = Math.round((startOfToday - startOfStart) / (1000 * 60 * 60 * 24));
         return Math.max(1, diffDays + 1);
     } catch { return 1; }
 }
@@ -230,7 +233,7 @@ app.post('/handle-menu', async (req, res) => {
                 twiml.say("Here is today's message from");
                 if (m.speaker_name_audio) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + m.speaker_name_audio);
                 else twiml.say(m.speaker_name);
-                twiml.say(': ' + m.title);
+                twiml.say('titled ' + m.title);
                 if (m.audio_url) twiml.play(m.audio_url);
                 else if (m.recorded_audio) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + m.recorded_audio);
                 else twiml.say("Audio not yet available.");
@@ -245,10 +248,9 @@ app.post('/handle-menu', async (req, res) => {
                 if (s?.all_messages_intro_file) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + s.all_messages_intro_file);
                 else twiml.say('Here are all available messages:');
                 all.rows.forEach((msg, i) => {
-                    twiml.say('Press ' + (i + 1) + ' for');
+                    twiml.say('Press ' + (i + 1) + ' for day ' + msg.day_number + ' message from');
                     if (msg.speaker_name_audio) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + msg.speaker_name_audio);
                     else twiml.say(msg.speaker_name);
-                    twiml.say("'s message from Day " + msg.day_number + '.');
                 });
                 if (s?.return_menu_audio_file) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + s.return_menu_audio_file);
                 else twiml.say('Press 0 to return to the main menu.');
@@ -329,7 +331,7 @@ app.post('/handle-message-selection', async (req, res) => {
             twiml.say('Day ' + msg.day_number + ' message from');
             if (msg.speaker_name_audio) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + msg.speaker_name_audio);
             else twiml.say(msg.speaker_name);
-            twiml.say(': ' + msg.title);
+            if (msg.title) twiml.say(msg.title);
             if (msg.audio_url) twiml.play(msg.audio_url);
             else if (msg.recorded_audio) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + msg.recorded_audio);
             else twiml.say('Audio not yet available.');
@@ -1191,4 +1193,4 @@ initDB().then(() => {
     app.listen(PORT, () => {
         console.log('Nishmas IVR server running on port ' + PORT);
     });
-}); 
+});
