@@ -114,6 +114,7 @@ async function initDB() {
             ['audio_url', 'TEXT'],
             ['recorded_audio', 'TEXT'],
             ['date_recorded', 'DATE'],
+            ['program_date', 'TEXT'],
             ['is_active', 'BOOLEAN DEFAULT true'],
             ['created_at', 'TIMESTAMP DEFAULT NOW()']
         ];
@@ -440,16 +441,16 @@ app.post('/api/messages', upload.fields([
     { name: 'speaker_audio', maxCount: 1 }
 ]), async (req, res) => {
     try {
-        const { day_number, title, speaker_name, audio_url } = req.body;
+        const { day_number, title, speaker_name, audio_url, program_date } = req.body;
         let recorded_audio = null, speaker_name_audio = null;
         if (req.files?.audio) recorded_audio = await convertToMp3(req.files.audio[0].filename);
         if (req.files?.speaker_audio) speaker_name_audio = await convertToMp3(req.files.speaker_audio[0].filename);
         
         const existing = await pool.query('SELECT id FROM nishmas_messages WHERE day_number = $1', [day_number]);
         if (existing.rows.length) {
-            let query = 'UPDATE nishmas_messages SET title = $2, speaker_name = $3, date_recorded = NOW()';
-            const params = [day_number, title, speaker_name];
-            let p = 4;
+            let query = 'UPDATE nishmas_messages SET title = $2, speaker_name = $3, date_recorded = NOW(), program_date = $4';
+            const params = [day_number, title, speaker_name, program_date || null];
+            let p = 5;
             if (speaker_name_audio) { query += ', speaker_name_audio = $' + p; params.push(speaker_name_audio); p++; }
             if (audio_url !== undefined) { query += ', audio_url = $' + p; params.push(audio_url || null); p++; }
             if (recorded_audio) { query += ', recorded_audio = $' + p; params.push(recorded_audio); p++; }
@@ -457,8 +458,8 @@ app.post('/api/messages', upload.fields([
             await pool.query(query, params);
         } else {
             await pool.query(
-                'INSERT INTO nishmas_messages (day_number, title, speaker_name, speaker_name_audio, audio_url, recorded_audio, date_recorded) VALUES ($1,$2,$3,$4,$5,$6,NOW())',
-                [day_number, title, speaker_name, speaker_name_audio, audio_url || null, recorded_audio]
+                'INSERT INTO nishmas_messages (day_number, title, speaker_name, speaker_name_audio, audio_url, recorded_audio, program_date, date_recorded) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())',
+                [day_number, title, speaker_name, speaker_name_audio, audio_url || null, recorded_audio, program_date || null]
             );
         }
         res.json({ success: true });
@@ -654,6 +655,10 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
         <div class="form-group">
           <label for="messageTitle">Message Title</label>
           <input type="text" id="messageTitle" placeholder="e.g., Introduction to Nishmas" required>
+        </div>
+        <div class="form-group">
+          <label for="programDate">Program Date (for your reference — e.g. "Sunday, May 10")</label>
+          <input type="text" id="programDate" placeholder="e.g., Sunday, May 10">
         </div>
         <div class="speaker-audio-section">
           <label class="section-title">🎙️ Speaker Name Audio (2-3 seconds)</label>
@@ -1131,6 +1136,7 @@ function displayMessages() {
           '<div style="color:var(--warning);font-size:.75rem;">⚠️ No name audio</div>') +
       '</div>' +
       '<div class="message-title">' + msg.title + '</div>' +
+      (msg.program_date ? '<div class="message-date" style="color:var(--gold,#d4a017);">📅 ' + msg.program_date + '</div>' : '') +
       '<div class="message-date">Added: ' + new Date(msg.date_recorded).toLocaleDateString() + '</div>' +
       (msg.recorded_audio ?
         '<audio controls><source src="/audio/' + msg.recorded_audio + '"></audio>' :
@@ -1182,6 +1188,7 @@ document.addEventListener('click', async (e) => {
     document.getElementById('dayNumber').value = m.day_number;
     document.getElementById('speakerName').value = m.speaker_name || '';
     document.getElementById('messageTitle').value = m.title;
+    document.getElementById('programDate').value = m.program_date || '';
     document.querySelector('.nav-tab[data-tab="add-message"]').click();
   } else if (action === 'delete') {
     const day = target.getAttribute('data-day');
@@ -1216,6 +1223,7 @@ document.getElementById('messageForm').addEventListener('submit', async (e) => {
   fd.append('day_number', document.getElementById('dayNumber').value);
   fd.append('speaker_name', document.getElementById('speakerName').value);
   fd.append('title', document.getElementById('messageTitle').value);
+  fd.append('program_date', document.getElementById('programDate').value);
   const af = document.getElementById('audioFile').files[0];
   const sf = document.getElementById('speakerAudio').files[0];
   if (af) fd.append('audio', af);
