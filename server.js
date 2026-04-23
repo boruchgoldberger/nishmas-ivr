@@ -182,37 +182,81 @@ async function getMostRecentMessage() {
     } catch { return null; }
 }
 
+// Today's message = message for exactly today's day_number. Returns null on skip days (no upload for this day).
+async function getTodaysMessage() {
+    try {
+        const currentDay = await getCurrentProgramDay();
+        const m = await pool.query('SELECT * FROM nishmas_messages WHERE day_number = $1 AND is_active = true', [currentDay]);
+        return m.rows[0] || null;
+    } catch { return null; }
+}
+
+// Yesterday's message = most recent active message with day_number < today. Skips gaps automatically.
+async function getYesterdaysMessage() {
+    try {
+        const currentDay = await getCurrentProgramDay();
+        for (let day = currentDay - 1; day >= 1; day--) {
+            const m = await pool.query('SELECT * FROM nishmas_messages WHERE day_number = $1 AND is_active = true', [day]);
+            if (m.rows.length) return m.rows[0];
+        }
+        return null;
+    } catch { return null; }
+}
+
 app.post('/webhook', async (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
     try {
         const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
         const s = settings.rows[0];
-        const todaysMessage = await getMostRecentMessage();
+        const todaysMessage = await getTodaysMessage();
+        const yesterdaysMessage = await getYesterdaysMessage();
         const currentDay = await getCurrentProgramDay();
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
 
         const gather = twiml.gather({ numDigits: 1, action: '/handle-menu', method: 'POST', timeout: 10 });
 
         // 1. Welcome greeting (uploaded or TTS default)
         if (s?.greeting_audio_file) {
-            gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.greeting_audio_file);
+            gather.play(audioBase + s.greeting_audio_file);
         } else {
             gather.say('Welcome to the 40 Days of Nishmas program.');
         }
 
-        // 2. Auto-generated day announcement (updates daily)
-        if (currentDay >= 1 && currentDay <= 40) {
-            gather.say('Today is day ' + currentDay + ' of Nishmas.');
+        // 2. Day announcement OR skip-day announcement
+        if (todaysMessage) {
+            // Regular day: announce day number + offer today/yesterday/all/nishmas
+            if (currentDay >= 1 && currentDay <= 40) {
+                gather.say('Today is day ' + currentDay + ' of Nishmas.');
+            }
+            // Press 1 — today's message
+            if (s?.press1_audio_file) gather.play(audioBase + s.press1_audio_file);
+            else gather.say("Press 1 for today's message from");
+            if (todaysMessage.speaker_name_audio) gather.play(audioBase + todaysMessage.speaker_name_audio);
+            else gather.say(todaysMessage.speaker_name);
+            // Press 2 — yesterday's message
+            gather.say('.');
+            if (yesterdaysMessage) {
+                gather.say("Press 2 for yesterday's message from");
+                if (yesterdaysMessage.speaker_name_audio) gather.play(audioBase + yesterdaysMessage.speaker_name_audio);
+                else gather.say(yesterdaysMessage.speaker_name);
+                gather.say('.');
+            }
+            // Press 3 — all previous messages
+            gather.say('Press 3 for all previous messages.');
+            // Press 4 — Nishmas
+            gather.say('Press 4 to hear Nishmas.');
+        } else {
+            // Skip day (Shabbos / Yom Tov / content not uploaded): no "today's message"
+            gather.say('There is no new message today.');
+            if (yesterdaysMessage) {
+                gather.say("To hear yesterday's message from");
+                if (yesterdaysMessage.speaker_name_audio) gather.play(audioBase + yesterdaysMessage.speaker_name_audio);
+                else gather.say(yesterdaysMessage.speaker_name);
+                gather.say(', press 1.');
+            }
+            gather.say('Press 2 for all previous messages.');
+            gather.say('Press 3 to hear Nishmas.');
         }
-
-        // 3. Press options (uploaded or TTS default)
-        if (s?.press1_audio_file) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.press1_audio_file);
-        else gather.say("Press 1 for today's message from");
-        if (todaysMessage?.speaker_name_audio) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + todaysMessage.speaker_name_audio);
-        else if (todaysMessage) gather.say(todaysMessage.speaker_name);
-        if (s?.press2_audio_file) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.press2_audio_file);
-        else gather.say('. Press 2 for all previous messages');
-        if (s?.press3_audio_file) gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.press3_audio_file);
-        else gather.say(', or press 3 to hear Nishmas.');
 
         twiml.say("We didn't receive your selection. Please try again.");
         twiml.redirect('/webhook');
@@ -226,62 +270,99 @@ app.post('/webhook', async (req, res) => {
 app.post('/handle-menu', async (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
     const digit = req.body.Digits;
+    const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
     try {
-        if (digit === '1') {
-            const m = await getMostRecentMessage();
-            if (m) {
-                twiml.say("Here is today's message from");
-                if (m.speaker_name_audio) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + m.speaker_name_audio);
-                else twiml.say(m.speaker_name);
-                twiml.say('titled ' + m.title);
-                if (m.audio_url) twiml.play(m.audio_url);
-                else if (m.recorded_audio) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + m.recorded_audio);
-                else twiml.say("Audio not yet available.");
-            } else twiml.say("Today's message is not yet available.");
+        const todaysMessage = await getTodaysMessage();
+        const yesterdaysMessage = await getYesterdaysMessage();
+        const isSkipDay = !todaysMessage;
+
+        // Helper: play a message and then return to menu
+        const playMessage = (m, introText) => {
+            twiml.say(introText + ' from');
+            if (m.speaker_name_audio) twiml.play(audioBase + m.speaker_name_audio);
+            else twiml.say(m.speaker_name);
+            if (m.title) twiml.say('titled ' + m.title);
+            if (m.audio_url) twiml.play(m.audio_url);
+            else if (m.recorded_audio) twiml.play(audioBase + m.recorded_audio);
+            else twiml.say('Audio not yet available.');
             twiml.say('Press any key to return to the main menu.');
             twiml.gather({ numDigits: 1, action: '/webhook', method: 'POST' });
-        } else if (digit === '2') {
+        };
+
+        // Helper: list all messages (old press-2 behavior, now mapped differently)
+        const listAllMessages = async () => {
             const all = await pool.query('SELECT * FROM nishmas_messages WHERE is_active = true ORDER BY day_number ASC');
-            if (all.rows.length) {
-                const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
-                const s = settings.rows[0];
-                if (s?.all_messages_intro_file) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + s.all_messages_intro_file);
-                else twiml.say('Here are all available messages:');
-                all.rows.forEach((msg, i) => {
-                    twiml.say('Press ' + (i + 1) + ' for day ' + msg.day_number + ' message from');
-                    if (msg.speaker_name_audio) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + msg.speaker_name_audio);
-                    else twiml.say(msg.speaker_name);
-                });
-                if (s?.return_menu_audio_file) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + s.return_menu_audio_file);
-                else twiml.say('Press 0 to return to the main menu.');
-                twiml.gather({ numDigits: 2, action: '/handle-message-selection', method: 'POST', timeout: 25 });
-            } else {
+            if (!all.rows.length) {
                 twiml.say('No messages available.');
                 twiml.redirect('/webhook');
+                return;
             }
-        } else if (digit === '3') {
             const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
             const s = settings.rows[0];
-            // If only legacy single file exists (no nusach versions), play it directly (backwards compat)
+            if (s?.all_messages_intro_file) twiml.play(audioBase + s.all_messages_intro_file);
+            else twiml.say('Here are all available messages:');
+            all.rows.forEach((msg, i) => {
+                twiml.say('Press ' + (i + 1) + ' for day ' + msg.day_number + ' message from');
+                if (msg.speaker_name_audio) twiml.play(audioBase + msg.speaker_name_audio);
+                else twiml.say(msg.speaker_name);
+            });
+            if (s?.return_menu_audio_file) twiml.play(audioBase + s.return_menu_audio_file);
+            else twiml.say('Press 0 to return to the main menu.');
+            twiml.gather({ numDigits: 2, action: '/handle-message-selection', method: 'POST', timeout: 25 });
+        };
+
+        // Helper: Nishmas prayer branch (nusach sub-menu)
+        const nishmasBranch = async () => {
+            const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+            const s = settings.rows[0];
             if (s?.nishmas_audio_file && !s?.nishmas_ashkenaz_file && !s?.nishmas_mizrach_file) {
                 twiml.say('Here is the Nishmas prayer.');
-                twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + s.nishmas_audio_file);
+                twiml.play(audioBase + s.nishmas_audio_file);
                 twiml.say('Thank you for saying Nishmas.');
                 twiml.redirect('/webhook');
             } else {
-                // Nusach selection sub-menu
                 const gather = twiml.gather({ numDigits: 1, action: '/handle-nusach-selection', method: 'POST', timeout: 10 });
                 if (s?.nishmas_nusach_prompt_file) {
-                    gather.play(req.protocol + '://' + req.get('host') + '/audio/' + s.nishmas_nusach_prompt_file);
+                    gather.play(audioBase + s.nishmas_nusach_prompt_file);
                 } else {
                     gather.say('Press 1 for Ashkenaz or Sfard. Press 2 for Eidot HaMizrach.');
                 }
                 twiml.say("We didn't receive your selection.");
                 twiml.redirect('/webhook');
             }
+        };
+
+        // --- MENU ROUTING ---
+        // Regular day: 1=today, 2=yesterday, 3=all, 4=nishmas
+        // Skip day:    1=yesterday, 2=all, 3=nishmas
+        if (!isSkipDay) {
+            if (digit === '1') {
+                if (todaysMessage) playMessage(todaysMessage, "Here is today's message");
+                else { twiml.say("Today's message is not yet available."); twiml.redirect('/webhook'); }
+            } else if (digit === '2') {
+                if (yesterdaysMessage) playMessage(yesterdaysMessage, "Here is yesterday's message");
+                else { twiml.say("Yesterday's message is not available."); twiml.redirect('/webhook'); }
+            } else if (digit === '3') {
+                await listAllMessages();
+            } else if (digit === '4') {
+                await nishmasBranch();
+            } else {
+                twiml.say('Invalid selection.');
+                twiml.redirect('/webhook');
+            }
         } else {
-            twiml.say('Invalid selection.');
-            twiml.redirect('/webhook');
+            // Skip day branch
+            if (digit === '1') {
+                if (yesterdaysMessage) playMessage(yesterdaysMessage, "Here is yesterday's message");
+                else { twiml.say("Yesterday's message is not available."); twiml.redirect('/webhook'); }
+            } else if (digit === '2') {
+                await listAllMessages();
+            } else if (digit === '3') {
+                await nishmasBranch();
+            } else {
+                twiml.say('Invalid selection.');
+                twiml.redirect('/webhook');
+            }
         }
     } catch (error) {
         console.error(error);
