@@ -657,8 +657,8 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
           <input type="text" id="messageTitle" placeholder="e.g., Introduction to Nishmas" required>
         </div>
         <div class="form-group">
-          <label for="programDate">Program Date (for your reference — e.g. "Sunday, May 10")</label>
-          <input type="text" id="programDate" placeholder="e.g., Sunday, May 10">
+          <label for="programDate">Program Date (for your reference)</label>
+          <input type="date" id="programDate">
         </div>
         <div class="speaker-audio-section">
           <label class="section-title">🎙️ Speaker Name Audio (2-3 seconds)</label>
@@ -1116,6 +1116,17 @@ function showCurrentAudio(key, containerId, label) {
   }
 }
 
+function formatProgramDate(dateStr) {
+  if (!dateStr) return '';
+  // Parse YYYY-MM-DD as local date (not UTC, to avoid off-by-one day shifts)
+  const iso = String(dateStr).split('T')[0].slice(0,10);
+  const parts = iso.split('-');
+  if (parts.length !== 3) return iso;
+  const d = new Date(parseInt(parts[0],10), parseInt(parts[1],10)-1, parseInt(parts[2],10));
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+}
+
 function displayMessages() {
   const container = document.getElementById('messagesContainer');
   if (!currentMessages.length) {
@@ -1136,7 +1147,7 @@ function displayMessages() {
           '<div style="color:var(--warning);font-size:.75rem;">⚠️ No name audio</div>') +
       '</div>' +
       '<div class="message-title">' + msg.title + '</div>' +
-      (msg.program_date ? '<div class="message-date" style="color:var(--gold,#d4a017);">📅 ' + msg.program_date + '</div>' : '') +
+      (msg.program_date ? '<div class="message-date" style="color:var(--gold,#d4a017);font-weight:600;">📅 ' + formatProgramDate(msg.program_date) + '</div>' : '') +
       '<div class="message-date">Added: ' + new Date(msg.date_recorded).toLocaleDateString() + '</div>' +
       (msg.recorded_audio ?
         '<audio controls><source src="/audio/' + msg.recorded_audio + '"></audio>' :
@@ -1188,7 +1199,7 @@ document.addEventListener('click', async (e) => {
     document.getElementById('dayNumber').value = m.day_number;
     document.getElementById('speakerName').value = m.speaker_name || '';
     document.getElementById('messageTitle').value = m.title;
-    document.getElementById('programDate').value = m.program_date || '';
+    document.getElementById('programDate').value = m.program_date ? String(m.program_date).split('T')[0].slice(0,10) : '';
     document.querySelector('.nav-tab[data-tab="add-message"]').click();
   } else if (action === 'delete') {
     const day = target.getAttribute('data-day');
