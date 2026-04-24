@@ -1236,9 +1236,10 @@ document.addEventListener('click', async (e) => {
   } else if (action === 'delete') {
     const day = target.getAttribute('data-day');
     const msg = currentMessages.find(x => x.day_number == day);
-    const speaker = msg?.speaker_name || 'Unknown speaker';
-    const title = msg?.title || 'No title';
-    if (!confirm('Delete Day ' + day + '?\n\nSpeaker: ' + speaker + '\nTitle: ' + title + '\n\nThis will permanently remove the message from the database. Callers will no longer hear this day. This cannot be undone.')) return;
+    const speaker = (msg && msg.speaker_name) || 'Unknown speaker';
+    const title = (msg && msg.title) || 'No title';
+    const NL = String.fromCharCode(10);
+    if (!confirm('Delete Day ' + day + '?' + NL + NL + 'Speaker: ' + speaker + NL + 'Title: ' + title + NL + NL + 'This will permanently remove the message from the database. Callers will no longer hear this day. This cannot be undone.')) return;
     try {
       const r = await fetch('/api/messages/' + day, { method: 'DELETE' });
       const result = await r.json().catch(() => ({}));
