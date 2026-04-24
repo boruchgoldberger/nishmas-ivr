@@ -472,7 +472,10 @@ app.delete('/api/messages/:day/speaker-audio', async (req, res) => {
 });
 
 app.delete('/api/messages/:day', async (req, res) => {
-    try { await pool.query('UPDATE nishmas_messages SET is_active = false WHERE day_number = $1', [req.params.day]); res.json({ success: true }); }
+    try { 
+        const result = await pool.query('DELETE FROM nishmas_messages WHERE day_number = $1 RETURNING id', [req.params.day]); 
+        res.json({ success: true, deleted: result.rowCount }); 
+    }
     catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -711,7 +714,11 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
 
   <div class="tab-content" id="messages">
     <div class="card">
-      <h2>All Messages</h2>
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;margin-bottom:1rem;">
+        <h2 style="margin:0;">All Messages</h2>
+        <div id="messagesStatusSummary" style="font-size:.9rem;color:var(--text-light);"></div>
+      </div>
+      <div id="messagesAlert"></div>
       <div class="messages-grid" id="messagesContainer">
         <div class="empty-state"><div class="empty-state-icon">⏳</div><p>Loading...</p></div>
       </div>
@@ -1129,13 +1136,38 @@ function formatProgramDate(dateStr) {
 
 function displayMessages() {
   const container = document.getElementById('messagesContainer');
+  const summary = document.getElementById('messagesStatusSummary');
+
+  // Summary counts
+  const total = currentMessages.length;
+  const withAudio = currentMessages.filter(m => m.recorded_audio).length;
+  const withNameAudio = currentMessages.filter(m => m.speaker_name_audio).length;
+  const missingAudio = total - withAudio;
+  if (summary) {
+    if (total === 0) {
+      summary.innerHTML = '';
+    } else {
+      summary.innerHTML =
+        '<span style="color:var(--success,#10b981);font-weight:600;">✅ ' + withAudio + ' with audio</span>' +
+        (missingAudio > 0 ? ' · <span style="color:var(--warning,#f59e0b);font-weight:600;">⚠️ ' + missingAudio + ' missing audio</span>' : '') +
+        ' · <span style="color:var(--text-light);">' + total + ' total</span>';
+    }
+  }
+
   if (!currentMessages.length) {
     container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">📝</div><p>No messages yet.</p></div>';
     return;
   }
-  container.innerHTML = currentMessages.map(msg =>
-    '<div class="message-card">' +
-      '<div class="day-badge">Day ' + msg.day_number + '</div>' +
+  container.innerHTML = currentMessages.map(msg => {
+    const ready = !!(msg.recorded_audio && msg.speaker_name && msg.title);
+    const readyBadge = ready
+      ? '<div style="display:inline-block;background:rgba(16,185,129,.15);color:#10b981;padding:.2rem .55rem;border-radius:6px;font-size:.7rem;font-weight:700;margin-left:.4rem;">✅ READY</div>'
+      : '<div style="display:inline-block;background:rgba(245,158,11,.15);color:#f59e0b;padding:.2rem .55rem;border-radius:6px;font-size:.7rem;font-weight:700;margin-left:.4rem;">⚠️ INCOMPLETE</div>';
+    return '<div class="message-card">' +
+      '<div style="display:flex;align-items:center;flex-wrap:wrap;">' +
+        '<div class="day-badge">Day ' + msg.day_number + '</div>' +
+        readyBadge +
+      '</div>' +
       '<div class="speaker-info">' +
         '<div class="speaker-name">Speaker: ' + (msg.speaker_name || 'Not specified') + '</div>' +
         (msg.speaker_name_audio ?
@@ -1146,7 +1178,7 @@ function displayMessages() {
           '</div>' :
           '<div style="color:var(--warning);font-size:.75rem;">⚠️ No name audio</div>') +
       '</div>' +
-      '<div class="message-title">' + msg.title + '</div>' +
+      '<div class="message-title">' + (msg.title || 'No title') + '</div>' +
       (msg.program_date ? '<div class="message-date" style="color:var(--gold,#d4a017);font-weight:600;">📅 ' + formatProgramDate(msg.program_date) + '</div>' : '') +
       '<div class="message-date">Added: ' + new Date(msg.date_recorded).toLocaleDateString() + '</div>' +
       (msg.recorded_audio ?
@@ -1156,8 +1188,8 @@ function displayMessages() {
         '<button class="btn btn-primary" data-day="' + msg.day_number + '" data-action="edit">Edit</button>' +
         '<button class="btn btn-danger" data-day="' + msg.day_number + '" data-action="delete">Delete</button>' +
       '</div>' +
-    '</div>'
-  ).join('');
+    '</div>';
+  }).join('');
 }
 
 // Event delegation for dynamically rendered buttons AND discard buttons
@@ -1203,10 +1235,22 @@ document.addEventListener('click', async (e) => {
     document.querySelector('.nav-tab[data-tab="add-message"]').click();
   } else if (action === 'delete') {
     const day = target.getAttribute('data-day');
-    if (!confirm('Delete this message?')) return;
-    const r = await fetch('/api/messages/' + day, { method: 'DELETE' });
-    if (r.ok) { showAlert('settings-alert', 'Deleted', 'success'); loadMessages(); }
-    else showAlert('settings-alert', 'Error deleting', 'error');
+    const msg = currentMessages.find(x => x.day_number == day);
+    const speaker = msg?.speaker_name || 'Unknown speaker';
+    const title = msg?.title || 'No title';
+    if (!confirm('Delete Day ' + day + '?\n\nSpeaker: ' + speaker + '\nTitle: ' + title + '\n\nThis will permanently remove the message from the database. Callers will no longer hear this day. This cannot be undone.')) return;
+    try {
+      const r = await fetch('/api/messages/' + day, { method: 'DELETE' });
+      const result = await r.json().catch(() => ({}));
+      if (r.ok && result.success && result.deleted > 0) {
+        showAlert('messagesAlert', '✅ Day ' + day + ' deleted and verified', 'success');
+        await loadMessages();
+      } else {
+        showAlert('messagesAlert', '❌ Delete may not have completed. Please refresh the page to verify.', 'error');
+      }
+    } catch (err) {
+      showAlert('messagesAlert', '❌ Error: ' + err.message, 'error');
+    }
   } else if (action === 'delete-speaker-audio') {
     const day = target.getAttribute('data-day');
     if (!confirm('Delete speaker audio for Day ' + day + '?')) return;
@@ -1243,15 +1287,25 @@ document.getElementById('messageForm').addEventListener('submit', async (e) => {
   try {
     const r = await fetch('/api/messages', { method: 'POST', body: fd });
     if (r.ok) {
-      showAlert('add-alert', 'Message saved', 'success');
+      // Re-fetch and verify the save actually persisted
+      const dayNum = parseInt(document.getElementById('dayNumber').value, 10);
+      const verifyRes = await fetch('/api/messages');
+      const allMessages = await verifyRes.json();
+      const saved = allMessages.find(m => m.day_number === dayNum);
+      if (saved) {
+        const savedTime = new Date().toLocaleTimeString();
+        showAlert('add-alert', '✅ Saved and verified in database at ' + savedTime + '. Day ' + dayNum + ' — ' + (saved.title || 'no title'), 'success');
+      } else {
+        showAlert('add-alert', '⚠️ Save appeared to succeed but could not be verified. Please check All Messages tab.', 'error');
+      }
       document.getElementById('messageForm').reset();
       document.querySelectorAll('.upload-area').forEach(a => a.classList.remove('has-file'));
       document.querySelectorAll('.recorded-preview').forEach(p => p.classList.remove('active'));
       loadMessages();
     } else {
-      showAlert('add-alert', 'Error saving', 'error');
+      showAlert('add-alert', '❌ Error saving — the server rejected the request', 'error');
     }
-  } catch (err) { showAlert('add-alert', 'Error: ' + err.message, 'error'); }
+  } catch (err) { showAlert('add-alert', '❌ Error: ' + err.message, 'error'); }
 });
 
 document.getElementById('settingsForm').addEventListener('submit', async (e) => {
