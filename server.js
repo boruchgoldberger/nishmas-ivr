@@ -105,6 +105,19 @@ async function initDB() {
                 created_at TIMESTAMP DEFAULT NOW()
             );
         `);
+
+        // Call log table — written to at each inbound call for analytics
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS nishmas_call_logs (
+                id SERIAL PRIMARY KEY,
+                call_sid TEXT,
+                phone_number TEXT,
+                program_day INTEGER,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_call_logs_phone ON nishmas_call_logs (phone_number);`).catch(()=>{});
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_call_logs_created ON nishmas_call_logs (created_at DESC);`).catch(()=>{});
         
         // Auto-heal: add any missing columns to nishmas_messages (in case table was created earlier with a different schema)
         const msgCols = [
@@ -204,7 +217,26 @@ async function getYesterdaysMessage() {
     } catch { return null; }
 }
 
+// Log an inbound call — fire-and-forget so failures never affect caller experience
+async function logCall(req) {
+    try {
+        const callSid = req.body?.CallSid || null;
+        const phone = req.body?.From || null;
+        let programDay = null;
+        try { programDay = await getCurrentProgramDay(); } catch(e) { /* ignore */ }
+        if (!phone && !callSid) return; // nothing to log
+        await pool.query(
+            'INSERT INTO nishmas_call_logs (call_sid, phone_number, program_day) VALUES ($1, $2, $3)',
+            [callSid, phone, programDay]
+        );
+    } catch (e) {
+        console.error('logCall error (non-fatal):', e.message);
+    }
+}
+
 app.post('/webhook', async (req, res) => {
+    // Log the call but don't await — never block the call if logging fails
+    logCall(req);
     const twiml = new twilio.twiml.VoiceResponse();
     try {
         const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
@@ -535,6 +567,71 @@ app.delete('/api/settings/audio/:field', async (req, res) => {
     if (!allowed.includes(field)) return res.status(400).json({ error: 'Invalid field' });
     try { await pool.query('UPDATE nishmas_settings SET ' + field + ' = NULL WHERE id = (SELECT id FROM nishmas_settings LIMIT 1)'); res.json({ success: true }); }
     catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// === Call log API — for the Bgold Platform Callers page ===
+// Default window: last 30 days
+
+// Chronological log — one row per call
+app.get('/api/call-logs', async (req, res) => {
+    try {
+        const days = parseInt(req.query.days || '30', 10);
+        const limit = Math.min(parseInt(req.query.limit || '2000', 10), 5000);
+        const r = await pool.query(
+            `SELECT id, call_sid, phone_number, program_day, created_at
+             FROM nishmas_call_logs
+             WHERE created_at > NOW() - ($1 || ' days')::interval
+             ORDER BY created_at DESC
+             LIMIT $2`,
+            [String(days), limit]
+        );
+        res.json({ calls: r.rows, total: r.rowCount, window_days: days });
+    } catch (e) {
+        console.error('call-logs error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Grouped by caller — one row per phone number
+app.get('/api/call-logs/by-caller', async (req, res) => {
+    try {
+        const days = parseInt(req.query.days || '30', 10);
+        const r = await pool.query(
+            `SELECT
+                phone_number,
+                COUNT(*)::int AS call_count,
+                MIN(created_at) AS first_call,
+                MAX(created_at) AS last_call,
+                ARRAY_AGG(DISTINCT program_day ORDER BY program_day) FILTER (WHERE program_day IS NOT NULL) AS days_heard
+             FROM nishmas_call_logs
+             WHERE created_at > NOW() - ($1 || ' days')::interval
+               AND phone_number IS NOT NULL
+             GROUP BY phone_number
+             ORDER BY MAX(created_at) DESC`,
+            [String(days)]
+        );
+        res.json({ callers: r.rows, window_days: days });
+    } catch (e) {
+        console.error('by-caller error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Summary counts
+app.get('/api/call-logs/summary', async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT
+                (SELECT COUNT(*)::int FROM nishmas_call_logs WHERE created_at > NOW() - INTERVAL '30 days') AS calls_30d,
+                (SELECT COUNT(*)::int FROM nishmas_call_logs WHERE created_at > NOW() - INTERVAL '7 days')  AS calls_7d,
+                (SELECT COUNT(*)::int FROM nishmas_call_logs WHERE created_at > NOW() - INTERVAL '1 day')   AS calls_today,
+                (SELECT COUNT(DISTINCT phone_number)::int FROM nishmas_call_logs WHERE created_at > NOW() - INTERVAL '30 days' AND phone_number IS NOT NULL) AS unique_callers_30d
+        `);
+        res.json(r.rows[0] || {});
+    } catch (e) {
+        console.error('summary error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
 });
 
 app.get('/admin', (req, res) => { res.send(ADMIN_HTML); });
