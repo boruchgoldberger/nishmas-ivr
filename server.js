@@ -12,14 +12,15 @@ const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 console.log('ffmpeg path set to:', ffmpegInstaller.path);
 
-// Convert any audio file (especially .webm browser recordings) to .mp3 for reliable Twilio playback.
-// Returns the new filename (the .mp3 version). The original .webm is deleted.
+// Convert any audio file (especially .webm browser recordings AND .wav uploads) to .mp3 for reliable Twilio playback.
+// MP3 plays most reliably on Twilio. WAV sometimes fails depending on encoding.
+// Returns the new filename (the .mp3 version). The original is deleted.
 function convertToMp3(inputFilename) {
     return new Promise((resolve, reject) => {
         const inputPath = path.join('uploads', inputFilename);
         const ext = path.extname(inputFilename).toLowerCase();
-        // If already mp3 or wav, keep as-is - Twilio plays those fine
-        if (ext === '.mp3' || ext === '.wav') return resolve(inputFilename);
+        // Only skip if already mp3 — convert everything else (webm, wav, m4a, ogg, etc.)
+        if (ext === '.mp3') return resolve(inputFilename);
         const outputFilename = inputFilename.replace(/\.[^.]+$/, '') + '.mp3';
         const outputPath = path.join('uploads', outputFilename);
         ffmpeg(inputPath)
@@ -74,6 +75,7 @@ async function initDB() {
                 day_number INTEGER UNIQUE NOT NULL,
                 date_recorded DATE NOT NULL,
                 title TEXT NOT NULL,
+                title_audio TEXT,
                 speaker_name TEXT NOT NULL,
                 speaker_name_audio TEXT,
                 audio_url TEXT,
@@ -122,6 +124,7 @@ async function initDB() {
         // Auto-heal: add any missing columns to nishmas_messages (in case table was created earlier with a different schema)
         const msgCols = [
             ['title', 'TEXT'],
+            ['title_audio', 'TEXT'],
             ['speaker_name', 'TEXT'],
             ['speaker_name_audio', 'TEXT'],
             ['audio_url', 'TEXT'],
@@ -267,12 +270,12 @@ app.post('/webhook', async (req, res) => {
             if (todaysMessage.speaker_name_audio) gather.play(audioBase + todaysMessage.speaker_name_audio);
             else gather.say(todaysMessage.speaker_name);
             // Press 2 — yesterday's message
-            gather.say('.');
+            gather.pause({ length: 1 });
             if (yesterdaysMessage) {
                 gather.say("Press 2 for yesterday's message from");
                 if (yesterdaysMessage.speaker_name_audio) gather.play(audioBase + yesterdaysMessage.speaker_name_audio);
                 else gather.say(yesterdaysMessage.speaker_name);
-                gather.say('.');
+                gather.pause({ length: 1 });
             }
             // Press 3 — all previous messages
             gather.say('Press 3 for all previous messages.');
@@ -314,7 +317,13 @@ app.post('/handle-menu', async (req, res) => {
             twiml.say(introText + ' from');
             if (m.speaker_name_audio) twiml.play(audioBase + m.speaker_name_audio);
             else twiml.say(m.speaker_name);
-            if (m.title) twiml.say('titled ' + m.title);
+            // Title — prefer recorded title audio, fall back to TTS
+            if (m.title_audio) {
+                twiml.say('titled');
+                twiml.play(audioBase + m.title_audio);
+            } else if (m.title) {
+                twiml.say('titled ' + m.title);
+            }
             if (m.audio_url) twiml.play(m.audio_url);
             else if (m.recorded_audio) twiml.play(audioBase + m.recorded_audio);
             else twiml.say('Audio not yet available.');
@@ -445,7 +454,8 @@ app.post('/handle-message-selection', async (req, res) => {
             twiml.say('Day ' + msg.day_number + ' message from');
             if (msg.speaker_name_audio) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + msg.speaker_name_audio);
             else twiml.say(msg.speaker_name);
-            if (msg.title) twiml.say(msg.title);
+            if (msg.title_audio) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + msg.title_audio);
+            else if (msg.title) twiml.say(msg.title);
             if (msg.audio_url) twiml.play(msg.audio_url);
             else if (msg.recorded_audio) twiml.play(req.protocol + '://' + req.get('host') + '/audio/' + msg.recorded_audio);
             else twiml.say('Audio not yet available.');
@@ -470,13 +480,15 @@ app.get('/api/messages', async (req, res) => {
 
 app.post('/api/messages', upload.fields([
     { name: 'audio', maxCount: 1 },
-    { name: 'speaker_audio', maxCount: 1 }
+    { name: 'speaker_audio', maxCount: 1 },
+    { name: 'title_audio', maxCount: 1 }
 ]), async (req, res) => {
     try {
         const { day_number, title, speaker_name, audio_url, program_date } = req.body;
-        let recorded_audio = null, speaker_name_audio = null;
+        let recorded_audio = null, speaker_name_audio = null, title_audio = null;
         if (req.files?.audio) recorded_audio = await convertToMp3(req.files.audio[0].filename);
         if (req.files?.speaker_audio) speaker_name_audio = await convertToMp3(req.files.speaker_audio[0].filename);
+        if (req.files?.title_audio) title_audio = await convertToMp3(req.files.title_audio[0].filename);
         
         const existing = await pool.query('SELECT id FROM nishmas_messages WHERE day_number = $1', [day_number]);
         if (existing.rows.length) {
@@ -484,14 +496,15 @@ app.post('/api/messages', upload.fields([
             const params = [day_number, title, speaker_name, program_date || null];
             let p = 5;
             if (speaker_name_audio) { query += ', speaker_name_audio = $' + p; params.push(speaker_name_audio); p++; }
+            if (title_audio) { query += ', title_audio = $' + p; params.push(title_audio); p++; }
             if (audio_url !== undefined) { query += ', audio_url = $' + p; params.push(audio_url || null); p++; }
             if (recorded_audio) { query += ', recorded_audio = $' + p; params.push(recorded_audio); p++; }
             query += ' WHERE day_number = $1';
             await pool.query(query, params);
         } else {
             await pool.query(
-                'INSERT INTO nishmas_messages (day_number, title, speaker_name, speaker_name_audio, audio_url, recorded_audio, program_date, date_recorded) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())',
-                [day_number, title, speaker_name, speaker_name_audio, audio_url || null, recorded_audio, program_date || null]
+                'INSERT INTO nishmas_messages (day_number, title, title_audio, speaker_name, speaker_name_audio, audio_url, recorded_audio, program_date, date_recorded) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())',
+                [day_number, title, title_audio, speaker_name, speaker_name_audio, audio_url || null, recorded_audio, program_date || null]
             );
         }
         res.json({ success: true });
@@ -500,6 +513,11 @@ app.post('/api/messages', upload.fields([
 
 app.delete('/api/messages/:day/speaker-audio', async (req, res) => {
     try { await pool.query('UPDATE nishmas_messages SET speaker_name_audio = NULL WHERE day_number = $1', [req.params.day]); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/messages/:day/title-audio', async (req, res) => {
+    try { await pool.query('UPDATE nishmas_messages SET title_audio = NULL WHERE day_number = $1', [req.params.day]); res.json({ success: true }); }
     catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -755,6 +773,28 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
         <div class="form-group">
           <label for="messageTitle">Message Title</label>
           <input type="text" id="messageTitle" placeholder="e.g., Introduction to Nishmas" required>
+        </div>
+        <div class="speaker-audio-section">
+          <label class="section-title">🏷️ Message Title Audio <span style="font-weight:400;font-size:.8rem;color:var(--text2)">(optional — record/upload someone saying the title)</span></label>
+          <div class="upload-area" id="titleUploadArea">
+            <div class="upload-icon">📁</div>
+            <div class="upload-text">Upload a file</div>
+            <div class="upload-subtext">MP3 / WAV / M4A</div>
+            <input type="file" id="titleAudio" name="title_audio" accept="audio/*" style="display:none">
+          </div>
+          <div class="or-divider">— or —</div>
+          <div class="record-row">
+            <button type="button" class="record-btn" data-target="titleAudio" data-area="titleUploadArea" data-preview="titlePreview">
+              <span class="icon">🎙️</span><span class="label">Record</span>
+            </button>
+          </div>
+          <div class="recorded-preview" id="titlePreview">
+            <div class="recorded-preview-label">✅ Recording ready — listen, then save message or discard</div>
+            <div class="recorded-preview-row">
+              <audio controls></audio>
+              <button type="button" class="delete-icon-btn" data-discard="titleAudio" data-preview="titlePreview" data-area="titleUploadArea" title="Discard recording">🗑️</button>
+            </div>
+          </div>
         </div>
         <div class="form-group">
           <label for="programDate">Program Date (for your reference)</label>
@@ -1150,7 +1190,7 @@ document.querySelectorAll('.upload-area').forEach(area => {
   });
 });
 
-['audioFile', 'speakerAudio', 'greetingAudio', 'press1Audio', 'press2Audio', 'press3Audio', 'nishmasAshkenaz', 'nishmasMizrach', 'nishmasNusachPrompt', 'allMessagesIntro', 'returnMenuAudio'].forEach(inputId => {
+['audioFile', 'speakerAudio', 'titleAudio', 'greetingAudio', 'press1Audio', 'press2Audio', 'press3Audio', 'nishmasAshkenaz', 'nishmasMizrach', 'nishmasNusachPrompt', 'allMessagesIntro', 'returnMenuAudio'].forEach(inputId => {
   const el = document.getElementById(inputId);
   if (el) {
     el.addEventListener('change', (e) => {
@@ -1276,6 +1316,12 @@ function displayMessages() {
           '<div style="color:var(--warning);font-size:.75rem;">⚠️ No name audio</div>') +
       '</div>' +
       '<div class="message-title">' + (msg.title || 'No title') + '</div>' +
+      (msg.title_audio ?
+        '<div class="current-audio-row" style="margin-top:.4rem;">' +
+          '<span style="font-size:.75rem;color:var(--text2);margin-right:.4rem;">🏷️ Title audio:</span>' +
+          '<audio controls><source src="/audio/' + msg.title_audio + '"></audio>' +
+          '<button type="button" class="delete-icon-btn" data-day="' + msg.day_number + '" data-action="delete-title-audio">🗑️</button>' +
+        '</div>' : '') +
       (msg.program_date ? '<div class="message-date" style="color:var(--gold,#d4a017);font-weight:600;">📅 ' + formatProgramDate(msg.program_date) + '</div>' : '') +
       '<div class="message-date">Added: ' + new Date(msg.date_recorded).toLocaleDateString() + '</div>' +
       (msg.recorded_audio ?
@@ -1355,6 +1401,12 @@ document.addEventListener('click', async (e) => {
     const r = await fetch('/api/messages/' + day + '/speaker-audio', { method: 'DELETE' });
     if (r.ok) { showAlert('add-alert', 'Speaker audio deleted', 'success'); loadMessages(); }
     else showAlert('add-alert', 'Error deleting', 'error');
+  } else if (action === 'delete-title-audio') {
+    const day = target.getAttribute('data-day');
+    if (!confirm('Delete title audio for Day ' + day + '?')) return;
+    const r = await fetch('/api/messages/' + day + '/title-audio', { method: 'DELETE' });
+    if (r.ok) { showAlert('add-alert', 'Title audio deleted', 'success'); loadMessages(); }
+    else showAlert('add-alert', 'Error deleting', 'error');
   } else if (action === 'delete-settings-audio') {
     const field = target.getAttribute('data-field');
     if (!confirm('Delete this audio?')) return;
@@ -1379,8 +1431,10 @@ document.getElementById('messageForm').addEventListener('submit', async (e) => {
   fd.append('program_date', document.getElementById('programDate').value);
   const af = document.getElementById('audioFile').files[0];
   const sf = document.getElementById('speakerAudio').files[0];
+  const tf = document.getElementById('titleAudio').files[0];
   if (af) fd.append('audio', af);
   if (sf) fd.append('speaker_audio', sf);
+  if (tf) fd.append('title_audio', tf);
 
   try {
     const r = await fetch('/api/messages', { method: 'POST', body: fd });
