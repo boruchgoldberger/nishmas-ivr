@@ -331,11 +331,18 @@ app.post('/handle-menu', async (req, res) => {
             twiml.gather({ numDigits: 1, action: '/webhook', method: 'POST' });
         };
 
-        // Helper: list all messages (old press-2 behavior, now mapped differently)
+        // Helper: list all PAST messages (only days that have already aired)
+        // Today's message is on Press 1 — Press 3 is for previously-aired days only.
         const listAllMessages = async () => {
-            const all = await pool.query('SELECT * FROM nishmas_messages WHERE is_active = true ORDER BY day_number ASC');
+            const all = await pool.query(
+                `SELECT * FROM nishmas_messages
+                 WHERE is_active = true
+                   AND program_date IS NOT NULL
+                   AND program_date::date < CURRENT_DATE
+                 ORDER BY day_number ASC`
+            );
             if (!all.rows.length) {
-                twiml.say('No messages available.');
+                twiml.say('No previous messages available yet.');
                 twiml.redirect('/webhook');
                 return;
             }
@@ -447,7 +454,15 @@ app.post('/handle-message-selection', async (req, res) => {
     const digits = req.body.Digits;
     try {
         if (digits === '0') { twiml.redirect('/webhook'); return res.type('text/xml').send(twiml.toString()); }
-        const all = await pool.query('SELECT * FROM nishmas_messages WHERE is_active = true ORDER BY day_number ASC');
+        // Same filter as listAllMessages — only past messages, in same order.
+        // Critical that this matches so the user's chosen number lines up with what was announced.
+        const all = await pool.query(
+            `SELECT * FROM nishmas_messages
+             WHERE is_active = true
+               AND program_date IS NOT NULL
+               AND program_date::date < CURRENT_DATE
+             ORDER BY day_number ASC`
+        );
         const i = parseInt(digits) - 1;
         if (i >= 0 && i < all.rows.length) {
             const msg = all.rows[i];
