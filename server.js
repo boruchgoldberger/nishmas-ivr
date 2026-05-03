@@ -917,19 +917,40 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
         </div>
         <div class="form-group">
           <label>Complete Message Audio</label>
-          <div class="upload-area" id="audioFileArea">
-            <div class="upload-icon">🎵</div>
-            <div class="upload-text">Upload full daily message</div>
-            <div class="upload-subtext">MP3/WAV file</div>
-            <input type="file" id="audioFile" accept="audio/*" style="display:none">
+          <!-- Option 1: Cloudinary direct upload -->
+          <div id="cloudinaryUploadArea" style="background:var(--bg2,#111318);border:2px dashed #d4a017;border-radius:8px;padding:1.25rem;text-align:center;cursor:pointer;margin-bottom:.75rem;" onclick="document.getElementById('cloudinaryFileInput').click()">
+            <div style="font-size:1.5rem;margin-bottom:.3rem;">☁️</div>
+            <div style="font-weight:600;color:#d4a017;font-size:.95rem;">Upload to Cloudinary (no size limit)</div>
+            <div style="font-size:.78rem;color:var(--text2,#8b93a8);margin-top:.2rem;">Uploads directly from browser — works for any file size</div>
+            <input type="file" id="cloudinaryFileInput" accept="audio/*" style="display:none" onchange="uploadToCloudinary(this.files[0])">
           </div>
-          <div class="or-divider">— or paste a URL —</div>
-          <input type="url" id="audioUrlInput" placeholder="https://www.dropbox.com/s/xxx/file.mp3?dl=1" 
+          <div id="cloudinaryProgress" style="display:none;margin-bottom:.75rem;">
+            <div style="background:var(--bg3,#0d1017);border-radius:100px;height:8px;overflow:hidden;margin-bottom:.4rem;">
+              <div id="cloudinaryProgressBar" style="height:100%;background:#d4a017;width:0%;transition:.3s;border-radius:100px;"></div>
+            </div>
+            <div id="cloudinaryProgressText" style="font-size:.8rem;color:var(--text2,#8b93a8);text-align:center;">Uploading...</div>
+          </div>
+          <div id="cloudinaryResult" style="display:none;margin-bottom:.75rem;background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);border-radius:8px;padding:.75rem;">
+            <div style="color:#34D399;font-size:.85rem;font-weight:600;margin-bottom:.4rem;">✓ Uploaded to Cloudinary!</div>
+            <audio id="cloudinaryAudioPreview" controls style="width:100%;margin-bottom:.4rem;"></audio>
+          </div>
+          <!-- Option 2: Paste URL -->
+          <div class="or-divider">— or paste a URL (Dropbox, etc.) —</div>
+          <input type="url" id="audioUrlInput" placeholder="https://www.dropbox.com/s/xxx/file.mp3?dl=1"
             style="width:100%;padding:.6rem .9rem;background:var(--bg2,#111318);border:1px solid var(--border,#1e2230);border-radius:8px;color:var(--text,#e8eaf0);font-size:.9rem;margin-bottom:.5rem;box-sizing:border-box;"
             oninput="let v=this.value.trim();if(v.includes('dropbox.com')){v=v.replace('dl=0','dl=1');if(!v.includes('dl='))v+=(v.includes('?')?'&':'?')+'dl=1';this.value=v;}document.getElementById('audioUrlPreview').style.display=v?'block':'none';document.getElementById('audioUrlPreviewSrc').src=v;">
           <div id="audioUrlPreview" style="display:none;margin-bottom:.5rem;">
             <audio id="audioUrlPreviewSrc" controls style="width:100%;"></audio>
           </div>
+          <!-- Option 3: Small file upload via server -->
+          <div class="or-divider">— or upload small file (under 10MB) —</div>
+          <div class="upload-area" id="audioFileArea">
+            <div class="upload-icon">🎵</div>
+            <div class="upload-text">Upload small audio file</div>
+            <div class="upload-subtext">MP3/WAV under 10MB</div>
+            <input type="file" id="audioFile" accept="audio/*" style="display:none">
+          </div>
+          <!-- Option 4: Record -->
           <div class="or-divider">— or record —</div>
           <div class="record-row">
             <button type="button" class="record-btn" data-target="audioFile" data-area="audioFileArea" data-preview="audioFilePreview">
@@ -1531,6 +1552,63 @@ function showAlert(containerId, message, type) {
   const c = document.getElementById(containerId);
   c.innerHTML = '<div class="alert alert-' + type + '">' + message + '</div>';
   setTimeout(() => { c.innerHTML = ''; }, 5000);
+}
+
+// Cloudinary direct upload
+async function uploadToCloudinary(file) {
+  if (!file) return;
+  const CLOUD_NAME = 'dlt5u84yt';
+  const UPLOAD_PRESET = 'nishmas_audio';
+  
+  document.getElementById('cloudinaryProgress').style.display = 'block';
+  document.getElementById('cloudinaryResult').style.display = 'none';
+  document.getElementById('cloudinaryProgressBar').style.width = '0%';
+  document.getElementById('cloudinaryProgressText').textContent = 'Uploading ' + file.name + '...';
+
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('upload_preset', UPLOAD_PRESET);
+  fd.append('resource_type', 'raw');
+
+  try {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', 'https://api.cloudinary.com/v1_1/' + CLOUD_NAME + '/raw/upload');
+    
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const pct = Math.round((e.loaded / e.total) * 100);
+        document.getElementById('cloudinaryProgressBar').style.width = pct + '%';
+        document.getElementById('cloudinaryProgressText').textContent = 'Uploading... ' + pct + '%';
+      }
+    };
+
+    xhr.onload = () => {
+      document.getElementById('cloudinaryProgress').style.display = 'none';
+      if (xhr.status === 200) {
+        const data = JSON.parse(xhr.responseText);
+        const url = data.secure_url;
+        // Store URL in the hidden audioUrlInput field
+        document.getElementById('audioUrlInput').value = url;
+        // Show result
+        document.getElementById('cloudinaryResult').style.display = 'block';
+        document.getElementById('cloudinaryAudioPreview').src = url;
+        // Clear manual URL field
+        document.getElementById('audioUrlInput').value = url;
+      } else {
+        alert('Cloudinary upload failed: ' + xhr.responseText);
+      }
+    };
+
+    xhr.onerror = () => {
+      document.getElementById('cloudinaryProgress').style.display = 'none';
+      alert('Upload failed. Check your internet connection.');
+    };
+
+    xhr.send(fd);
+  } catch(e) {
+    document.getElementById('cloudinaryProgress').style.display = 'none';
+    alert('Upload error: ' + e.message);
+  }
 }
 
 document.getElementById('messageForm').addEventListener('submit', async (e) => {
