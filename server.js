@@ -558,6 +558,58 @@ app.post('/handle-message-selection', async (req, res) => {
     res.type('text/xml').send(twiml.toString());
 });
 
+// Chunked upload endpoint — splits large files into small pieces to bypass Railway timeout
+const uploadChunks = {};
+
+app.post('/api/upload-chunk', upload.single('chunk'), async (req, res) => {
+  try {
+    const { upload_id, chunk_index, total_chunks, filename } = req.body;
+    if (!upload_id || chunk_index === undefined || !total_chunks || !filename) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    if (!uploadChunks[upload_id]) uploadChunks[upload_id] = { chunks: {}, filename, total: parseInt(total_chunks) };
+    uploadChunks[upload_id].chunks[parseInt(chunk_index)] = req.file.path;
+
+    const received = Object.keys(uploadChunks[upload_id].chunks).length;
+    const total = uploadChunks[upload_id].total;
+
+    if (received === total) {
+      // All chunks received — assemble
+      const ext = path.extname(filename).toLowerCase();
+      const safeName = Date.now() + '_' + filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const finalPath = 'uploads/' + safeName;
+      const writeStream = fs.createWriteStream(finalPath);
+      for (let i = 0; i < total; i++) {
+        const chunkPath = uploadChunks[upload_id].chunks[i];
+        const data = fs.readFileSync(chunkPath);
+        writeStream.write(data);
+        fs.unlinkSync(chunkPath);
+      }
+      writeStream.end();
+      delete uploadChunks[upload_id];
+
+      // If not already mp3, convert
+      let finalFile = safeName;
+      if (ext !== '.mp3') {
+        try {
+          const mp3Name = safeName.replace(ext, '.mp3');
+          await new Promise((resolve, reject) => {
+            ffmpeg(finalPath).toFormat('mp3').on('end', resolve).on('error', reject).save('uploads/' + mp3Name);
+          });
+          fs.unlinkSync(finalPath);
+          finalFile = mp3Name;
+        } catch(e) { console.error('Conversion error:', e.message); }
+      }
+      return res.json({ ok: true, filename: finalFile, url: '/audio/' + finalFile });
+    }
+
+    res.json({ ok: true, received, total });
+  } catch(e) {
+    console.error('Chunk upload error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/messages', async (req, res) => {
     const messages = await pool.query('SELECT * FROM nishmas_messages ORDER BY day_number ASC');
     res.json(messages.rows);
@@ -917,11 +969,11 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
         </div>
         <div class="form-group">
           <label>Complete Message Audio</label>
-          <!-- Option 1: Cloudinary direct upload -->
+          <!-- Option 1: Chunked upload (bypasses Railway timeout) -->
           <div id="cloudinaryUploadArea" style="background:var(--bg2,#111318);border:2px dashed #d4a017;border-radius:8px;padding:1.25rem;text-align:center;cursor:pointer;margin-bottom:.75rem;" onclick="document.getElementById('cloudinaryFileInput').click()">
-            <div style="font-size:1.5rem;margin-bottom:.3rem;">☁️</div>
-            <div style="font-weight:600;color:#d4a017;font-size:.95rem;">Upload to Cloudinary (no size limit)</div>
-            <div style="font-size:.78rem;color:var(--text2,#8b93a8);margin-top:.2rem;">Uploads directly from browser — works for any file size</div>
+            <div style="font-size:1.5rem;margin-bottom:.3rem;">🎵</div>
+            <div style="font-weight:600;color:#d4a017;font-size:.95rem;">Upload Any Size Audio</div>
+            <div style="font-size:.78rem;color:var(--text2,#8b93a8);margin-top:.2rem;">Uploads in chunks — works for large files without timeout</div>
             <input type="file" id="cloudinaryFileInput" accept="audio/*" style="display:none" onchange="uploadToCloudinary(this.files[0])">
           </div>
           <div id="cloudinaryProgress" style="display:none;margin-bottom:.75rem;">
@@ -1554,60 +1606,56 @@ function showAlert(containerId, message, type) {
   setTimeout(() => { c.innerHTML = ''; }, 5000);
 }
 
-// Cloudinary direct upload
+// Chunked upload — splits file into 2MB pieces to bypass Railway timeout
 async function uploadToCloudinary(file) {
   if (!file) return;
-  const CLOUD_NAME = 'dlt5u84yt';
-  const UPLOAD_PRESET = 'nishmas_audio';
-  
+  const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB chunks
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  const uploadId = Date.now() + '_' + Math.random().toString(36).slice(2);
+
   document.getElementById('cloudinaryProgress').style.display = 'block';
   document.getElementById('cloudinaryResult').style.display = 'none';
   document.getElementById('cloudinaryProgressBar').style.width = '0%';
-  document.getElementById('cloudinaryProgressText').textContent = 'Uploading ' + file.name + '...';
-
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('upload_preset', UPLOAD_PRESET);
-  fd.append('resource_type', 'raw');
+  document.getElementById('cloudinaryProgressText').textContent = 'Uploading 0 of ' + totalChunks + ' parts...';
 
   try {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', 'https://api.cloudinary.com/v1_1/' + CLOUD_NAME + '/raw/upload');
-    
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
-        const pct = Math.round((e.loaded / e.total) * 100);
-        document.getElementById('cloudinaryProgressBar').style.width = pct + '%';
-        document.getElementById('cloudinaryProgressText').textContent = 'Uploading... ' + pct + '%';
-      }
-    };
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, file.size);
+      const chunk = file.slice(start, end);
 
-    xhr.onload = () => {
-      document.getElementById('cloudinaryProgress').style.display = 'none';
-      if (xhr.status === 200) {
-        const data = JSON.parse(xhr.responseText);
-        const url = data.secure_url;
-        // Store URL in the hidden audioUrlInput field
-        document.getElementById('audioUrlInput').value = url;
-        // Show result
+      const fd = new FormData();
+      fd.append('chunk', chunk, file.name);
+      fd.append('upload_id', uploadId);
+      fd.append('chunk_index', i);
+      fd.append('total_chunks', totalChunks);
+      fd.append('filename', file.name);
+
+      const resp = await fetch('/api/upload-chunk', { method: 'POST', body: fd });
+      const data = await resp.json();
+
+      const pct = Math.round(((i + 1) / totalChunks) * 100);
+      document.getElementById('cloudinaryProgressBar').style.width = pct + '%';
+      document.getElementById('cloudinaryProgressText').textContent = 'Uploading part ' + (i+1) + ' of ' + totalChunks + '...';
+
+      if (data.ok && data.url) {
+        // All chunks done — file assembled
+        const fullUrl = window.location.origin + data.url;
+        document.getElementById('audioUrlInput').value = fullUrl;
+        document.getElementById('cloudinaryProgress').style.display = 'none';
         document.getElementById('cloudinaryResult').style.display = 'block';
-        document.getElementById('cloudinaryAudioPreview').src = url;
-        // Clear manual URL field
-        document.getElementById('audioUrlInput').value = url;
-      } else {
-        alert('Cloudinary upload failed: ' + xhr.responseText);
+        document.getElementById('cloudinaryAudioPreview').src = fullUrl;
+        document.getElementById('cloudinaryProgressText').textContent = 'Upload complete!';
+        return;
       }
-    };
 
-    xhr.onerror = () => {
-      document.getElementById('cloudinaryProgress').style.display = 'none';
-      alert('Upload failed. Check your internet connection.');
-    };
-
-    xhr.send(fd);
+      if (!resp.ok) {
+        throw new Error(data.error || 'Upload failed at chunk ' + i);
+      }
+    }
   } catch(e) {
     document.getElementById('cloudinaryProgress').style.display = 'none';
-    alert('Upload error: ' + e.message);
+    alert('Upload failed: ' + e.message);
   }
 }
 
