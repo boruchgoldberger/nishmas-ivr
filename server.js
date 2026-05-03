@@ -132,7 +132,8 @@ async function initDB() {
             ['date_recorded', 'DATE'],
             ['program_date', 'TEXT'],
             ['is_active', 'BOOLEAN DEFAULT true'],
-            ['created_at', 'TIMESTAMP DEFAULT NOW()']
+            ['created_at', 'TIMESTAMP DEFAULT NOW()'],
+            ['allow_skip', 'BOOLEAN DEFAULT false']
         ];
         for (const [col, type] of msgCols) {
             await pool.query(`ALTER TABLE nishmas_messages ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
@@ -312,8 +313,8 @@ app.post('/handle-menu', async (req, res) => {
         const yesterdaysMessage = await getYesterdaysMessage();
         const isSkipDay = !todaysMessage;
 
-        // Helper: play a message and then return to menu
-        const playMessage = (m, introText) => {
+        // Helper: play a message with optional skip support
+        const playMessage = (m, introText, offsetSeconds) => {
             twiml.say(introText + ' from');
             if (m.speaker_name_audio) twiml.play(audioBase + m.speaker_name_audio);
             else twiml.say(m.speaker_name);
@@ -324,11 +325,34 @@ app.post('/handle-menu', async (req, res) => {
             } else if (m.title) {
                 twiml.say('titled ' + m.title);
             }
-            if (m.audio_url) twiml.play(m.audio_url);
-            else if (m.recorded_audio) twiml.play(audioBase + m.recorded_audio);
-            else twiml.say('Audio not yet available.');
-            twiml.say('Press any key to return to the main menu.');
-            twiml.gather({ numDigits: 1, action: '/webhook', method: 'POST' });
+
+            const audioSrc = m.audio_url || (m.recorded_audio ? audioBase + m.recorded_audio : null);
+
+            if (!audioSrc) {
+                twiml.say('Audio not yet available.');
+            } else if (m.allow_skip) {
+                // Announce skip option
+                twiml.say('To skip ahead 30 seconds at any time, press 5.');
+                // Use Gather to detect press-5 during playback
+                const offset = offsetSeconds || 0;
+                const audioUrl = offset > 0 ? audioSrc + (audioSrc.includes('?') ? '&' : '?') + 't=' + offset : audioSrc;
+                const msgId = m.id || m.day_number;
+                const gather = twiml.gather({
+                    numDigits: '1',
+                    action: '/handle-skip?msg_id=' + msgId + '&offset=' + (offset + 30),
+                    method: 'POST',
+                    timeout: '3600',
+                    actionOnEmptyResult: false
+                });
+                gather.play(audioUrl);
+                // If they don't press anything, audio finishes naturally
+                twiml.say('Press any key to return to the main menu.');
+                twiml.gather({ numDigits: 1, action: '/webhook', method: 'POST' });
+            } else {
+                twiml.play(audioSrc);
+                twiml.say('Press any key to return to the main menu.');
+                twiml.gather({ numDigits: 1, action: '/webhook', method: 'POST' });
+            }
         };
 
         // Helper: list all PAST messages (only days that have already aired)
@@ -449,6 +473,52 @@ app.post('/handle-nusach-selection', async (req, res) => {
     res.type('text/xml').send(twiml.toString());
 });
 
+app.post('/handle-skip', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const digit = req.body.Digits;
+        const msgId = req.query.msg_id;
+        const offset = parseInt(req.query.offset) || 30;
+
+        // Only handle press-5 as skip; anything else = return to menu
+        if (digit === '5') {
+            // Find the message and replay from new offset
+            const result = await pool.query('SELECT * FROM nishmas_messages WHERE id = $1 OR day_number = $1::int', [msgId]);
+            const m = result.rows[0];
+            if (m) {
+                const audioBase = process.env.AUDIO_BASE_URL || '';
+                const audioSrc = m.audio_url || (m.recorded_audio ? audioBase + m.recorded_audio : null);
+                if (audioSrc) {
+                    twiml.say('Skipping ahead 30 seconds.');
+                    const gather = twiml.gather({
+                        numDigits: '1',
+                        action: '/handle-skip?msg_id=' + msgId + '&offset=' + (offset + 30),
+                        method: 'POST',
+                        timeout: '3600',
+                        actionOnEmptyResult: false
+                    });
+                    // Note: not all audio URLs support time offset — works for direct MP3 links
+                    gather.play(audioSrc + '#t=' + offset);
+                    twiml.say('Press any key to return to the main menu.');
+                    twiml.gather({ numDigits: 1, action: '/webhook', method: 'POST' });
+                } else {
+                    twiml.say('Audio not available.');
+                    twiml.redirect('/webhook');
+                }
+            } else {
+                twiml.redirect('/webhook');
+            }
+        } else {
+            // Any other key = return to main menu
+            twiml.redirect('/webhook');
+        }
+    } catch (err) {
+        console.error('handle-skip error:', err);
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
 app.post('/handle-message-selection', async (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
     const digits = req.body.Digits;
@@ -505,11 +575,12 @@ app.post('/api/messages', upload.fields([
         if (req.files?.speaker_audio) speaker_name_audio = await convertToMp3(req.files.speaker_audio[0].filename);
         if (req.files?.title_audio) title_audio = await convertToMp3(req.files.title_audio[0].filename);
         
+        const allow_skip = req.body.allow_skip === 'true' || req.body.allow_skip === true;
         const existing = await pool.query('SELECT id FROM nishmas_messages WHERE day_number = $1', [day_number]);
         if (existing.rows.length) {
-            let query = 'UPDATE nishmas_messages SET title = $2, speaker_name = $3, date_recorded = NOW(), program_date = $4';
-            const params = [day_number, title, speaker_name, program_date || null];
-            let p = 5;
+            let query = 'UPDATE nishmas_messages SET title = $2, speaker_name = $3, date_recorded = NOW(), program_date = $4, allow_skip = $5';
+            const params = [day_number, title, speaker_name, program_date || null, allow_skip];
+            let p = 6;
             if (speaker_name_audio) { query += ', speaker_name_audio = $' + p; params.push(speaker_name_audio); p++; }
             if (title_audio) { query += ', title_audio = $' + p; params.push(title_audio); p++; }
             if (audio_url !== undefined) { query += ', audio_url = $' + p; params.push(audio_url || null); p++; }
@@ -518,8 +589,8 @@ app.post('/api/messages', upload.fields([
             await pool.query(query, params);
         } else {
             await pool.query(
-                'INSERT INTO nishmas_messages (day_number, title, title_audio, speaker_name, speaker_name_audio, audio_url, recorded_audio, program_date, date_recorded) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())',
-                [day_number, title, title_audio, speaker_name, speaker_name_audio, audio_url || null, recorded_audio, program_date || null]
+                'INSERT INTO nishmas_messages (day_number, title, title_audio, speaker_name, speaker_name_audio, audio_url, recorded_audio, program_date, allow_skip, date_recorded) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())',
+                [day_number, title, title_audio, speaker_name, speaker_name_audio, audio_url || null, recorded_audio, program_date || null, allow_skip]
             );
         }
         res.json({ success: true });
@@ -814,6 +885,13 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
         <div class="form-group">
           <label for="programDate">Program Date (for your reference)</label>
           <input type="date" id="programDate">
+          <div style="margin-top:1rem;display:flex;align-items:center;gap:.75rem;background:var(--bg2,#111318);border:1px solid var(--border,#1e2230);border-radius:8px;padding:.75rem 1rem;">
+            <input type="checkbox" id="allowSkip" style="width:18px;height:18px;cursor:pointer;accent-color:#d4a017;">
+            <div>
+              <label for="allowSkip" style="font-weight:600;cursor:pointer;color:var(--text,#e8eaf0);">Enable 30-second skip (Press 5)</label>
+              <div style="font-size:.8rem;color:var(--text2,#8b93a8);margin-top:.2rem;">Callers will hear "Press 5 to skip ahead 30 seconds" before the message plays</div>
+            </div>
+          </div>
         </div>
         <div class="speaker-audio-section">
           <label class="section-title">🎙️ Speaker Name Audio (2-3 seconds)</label>
@@ -1338,6 +1416,7 @@ function displayMessages() {
           '<button type="button" class="delete-icon-btn" data-day="' + msg.day_number + '" data-action="delete-title-audio">🗑️</button>' +
         '</div>' : '') +
       (msg.program_date ? '<div class="message-date" style="color:var(--gold,#d4a017);font-weight:600;">📅 ' + formatProgramDate(msg.program_date) + '</div>' : '') +
+      (msg.allow_skip ? '<div style="display:inline-block;background:rgba(212,160,23,.15);color:#d4a017;font-size:.72rem;font-weight:700;padding:.15rem .5rem;border-radius:10px;margin:.3rem 0;">⏩ Skip enabled</div>' : '') +
       '<div class="message-date">Added: ' + new Date(msg.date_recorded).toLocaleDateString() + '</div>' +
       (msg.recorded_audio ?
         '<audio controls><source src="/audio/' + msg.recorded_audio + '"></audio>' :
@@ -1390,6 +1469,7 @@ document.addEventListener('click', async (e) => {
     document.getElementById('speakerName').value = m.speaker_name || '';
     document.getElementById('messageTitle').value = m.title;
     document.getElementById('programDate').value = m.program_date ? String(m.program_date).split('T')[0].slice(0,10) : '';
+    document.getElementById('allowSkip').checked = !!m.allow_skip;
     document.querySelector('.nav-tab[data-tab="add-message"]').click();
   } else if (action === 'delete') {
     const day = target.getAttribute('data-day');
@@ -1444,6 +1524,7 @@ document.getElementById('messageForm').addEventListener('submit', async (e) => {
   fd.append('speaker_name', document.getElementById('speakerName').value);
   fd.append('title', document.getElementById('messageTitle').value);
   fd.append('program_date', document.getElementById('programDate').value);
+  fd.append('allow_skip', document.getElementById('allowSkip').checked ? 'true' : 'false');
   const af = document.getElementById('audioFile').files[0];
   const sf = document.getElementById('speakerAudio').files[0];
   const tf = document.getElementById('titleAudio').files[0];
