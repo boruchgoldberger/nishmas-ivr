@@ -926,7 +926,7 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
           <div class="or-divider">— or paste a URL —</div>
           <input type="url" id="audioUrlInput" placeholder="https://www.dropbox.com/s/xxx/file.mp3?dl=1" 
             style="width:100%;padding:.6rem .9rem;background:var(--bg2,#111318);border:1px solid var(--border,#1e2230);border-radius:8px;color:var(--text,#e8eaf0);font-size:.9rem;margin-bottom:.5rem;box-sizing:border-box;"
-            oninput="document.getElementById('audioUrlPreview').style.display=this.value?'block':'none';document.getElementById('audioUrlPreviewSrc').src=this.value;">
+            oninput="let v=this.value.trim();if(v.includes('dropbox.com')){v=v.replace('dl=0','dl=1');if(!v.includes('dl='))v+=(v.includes('?')?'&':'?')+'dl=1';this.value=v;}document.getElementById('audioUrlPreview').style.display=v?'block':'none';document.getElementById('audioUrlPreviewSrc').src=v;">
           <div id="audioUrlPreview" style="display:none;margin-bottom:.5rem;">
             <audio id="audioUrlPreviewSrc" controls style="width:100%;"></audio>
           </div>
