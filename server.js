@@ -45,8 +45,8 @@ function convertToMp3(inputFilename) {
 }
 
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '500mb' }));
+app.use(express.urlencoded({ extended: true, limit: '500mb' }));
 app.use(cors());
 
 app.use('/audio', express.static('uploads'));
@@ -63,7 +63,7 @@ const storage = multer.diskStorage({
         cb(null, Date.now() + '-' + safeName);
     }
 });
-const upload = multer({ storage });
+const upload = multer({ storage, limits: { fileSize: 500 * 1024 * 1024 } }); // 500MB limit
 
 if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
 
@@ -923,7 +923,14 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
             <div class="upload-subtext">MP3/WAV file</div>
             <input type="file" id="audioFile" accept="audio/*" style="display:none">
           </div>
-          <div class="or-divider">— or —</div>
+          <div class="or-divider">— or paste a URL —</div>
+          <input type="url" id="audioUrlInput" placeholder="https://www.dropbox.com/s/xxx/file.mp3?dl=1" 
+            style="width:100%;padding:.6rem .9rem;background:var(--bg2,#111318);border:1px solid var(--border,#1e2230);border-radius:8px;color:var(--text,#e8eaf0);font-size:.9rem;margin-bottom:.5rem;box-sizing:border-box;"
+            oninput="document.getElementById('audioUrlPreview').style.display=this.value?'block':'none';document.getElementById('audioUrlPreviewSrc').src=this.value;">
+          <div id="audioUrlPreview" style="display:none;margin-bottom:.5rem;">
+            <audio id="audioUrlPreviewSrc" controls style="width:100%;"></audio>
+          </div>
+          <div class="or-divider">— or record —</div>
           <div class="record-row">
             <button type="button" class="record-btn" data-target="audioFile" data-area="audioFileArea" data-preview="audioFilePreview">
               <span class="icon">🎙️</span><span class="label">Record</span>
@@ -1470,6 +1477,15 @@ document.addEventListener('click', async (e) => {
     document.getElementById('messageTitle').value = m.title;
     document.getElementById('programDate').value = m.program_date ? String(m.program_date).split('T')[0].slice(0,10) : '';
     document.getElementById('allowSkip').checked = !!m.allow_skip;
+    const urlInput = document.getElementById('audioUrlInput');
+    if (m.audio_url) {
+      urlInput.value = m.audio_url;
+      document.getElementById('audioUrlPreview').style.display = 'block';
+      document.getElementById('audioUrlPreviewSrc').src = m.audio_url;
+    } else {
+      urlInput.value = '';
+      document.getElementById('audioUrlPreview').style.display = 'none';
+    }
     document.querySelector('.nav-tab[data-tab="add-message"]').click();
   } else if (action === 'delete') {
     const day = target.getAttribute('data-day');
@@ -1525,6 +1541,8 @@ document.getElementById('messageForm').addEventListener('submit', async (e) => {
   fd.append('title', document.getElementById('messageTitle').value);
   fd.append('program_date', document.getElementById('programDate').value);
   fd.append('allow_skip', document.getElementById('allowSkip').checked ? 'true' : 'false');
+  const pastedUrl = document.getElementById('audioUrlInput').value.trim();
+  if (pastedUrl) fd.append('audio_url', pastedUrl);
   const af = document.getElementById('audioFile').files[0];
   const sf = document.getElementById('speakerAudio').files[0];
   const tf = document.getElementById('titleAudio').files[0];
@@ -1547,6 +1565,8 @@ document.getElementById('messageForm').addEventListener('submit', async (e) => {
         showAlert('add-alert', '⚠️ Save appeared to succeed but could not be verified. Please check All Messages tab.', 'error');
       }
       document.getElementById('messageForm').reset();
+      document.getElementById('audioUrlInput').value = '';
+      document.getElementById('audioUrlPreview').style.display = 'none';
       document.querySelectorAll('.upload-area').forEach(a => a.classList.remove('has-file'));
       document.querySelectorAll('.recorded-preview').forEach(p => p.classList.remove('active'));
       loadMessages();
