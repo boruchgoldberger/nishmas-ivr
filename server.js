@@ -384,6 +384,14 @@ app.post('/webhook', async (req, res) => {
             gather.say('Welcome to the 40 Days of Nishmas program.');
         }
 
+        // 1b. Donation prompt — plays right after welcome, before menu options
+        if (s?.donation_enabled !== false) {
+            gather.pause({ length: 1 });
+            if (s?.donate_intro_audio_file) gather.play(audioBase + s.donate_intro_audio_file);
+            else gather.say('Press ' + (s?.donation_digit || '9') + ' to make a donation.');
+            gather.pause({ length: 1 });
+        }
+
         // 2. Day announcement OR skip-day announcement
         if (todaysMessage) {
             // Regular day: announce day number + offer today/yesterday/all/nishmas
@@ -396,12 +404,6 @@ app.post('/webhook', async (req, res) => {
             if (todaysMessage.speaker_name_audio) gather.play(audioBase + todaysMessage.speaker_name_audio);
             else gather.say(todaysMessage.speaker_name);
             gather.pause({ length: 1 });
-            // Press configurable digit — donate (second menu option, only if enabled)
-            if (s?.donation_enabled !== false) {
-                if (s?.donate_intro_audio_file) gather.play(audioBase + s.donate_intro_audio_file);
-                else gather.say('Press ' + (s?.donation_digit || '9') + ' to make a donation.');
-                gather.pause({ length: 1 });
-            }
             // Press 2 — yesterday's message
             if (yesterdaysMessage) {
                 gather.say("Press 2 for yesterday's message from");
@@ -421,12 +423,6 @@ app.post('/webhook', async (req, res) => {
                 if (yesterdaysMessage.speaker_name_audio) gather.play(audioBase + yesterdaysMessage.speaker_name_audio);
                 else gather.say(yesterdaysMessage.speaker_name);
                 gather.say(', press 1.');
-                gather.pause({ length: 1 });
-            }
-            // Press configurable digit — donate (second menu option, only if enabled)
-            if (s?.donation_enabled !== false) {
-                if (s?.donate_intro_audio_file) gather.play(audioBase + s.donate_intro_audio_file);
-                else gather.say('Press ' + (s?.donation_digit || '9') + ' to make a donation.');
                 gather.pause({ length: 1 });
             }
             gather.say('Press 2 for all previous messages.');
