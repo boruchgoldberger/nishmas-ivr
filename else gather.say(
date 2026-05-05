@@ -616,7 +616,7 @@ app.post('/handle-menu', async (req, res) => {
             });
             if (s?.return_menu_audio_file) twiml.play(audioBase + s.return_menu_audio_file);
             else twiml.say('Press 0 to return to the main menu.');
-            twiml.gather({ numDigits: 2, action: '/handle-message-selection', method: 'POST', timeout: 25 });
+            twiml.gather({ numDigits: 3, action: '/handle-message-selection', method: 'POST', timeout: 25 });
         };
 
         // Helper: Nishmas prayer branch (nusach sub-menu)
@@ -933,10 +933,10 @@ app.post('/donate/expiry', async (req, res) => {
         const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
         const gather = twiml.gather({
             input: 'dtmf', numDigits: 4, action: '/donate/process?d=' + donationId + '&c=' + card + '&em=' + expM + '&ey=' + expY,
-            method: 'POST', timeout: 15, finishOnKey: '#'
+            method: 'POST', timeout: 20, finishOnKey: '#'
         });
         if (s.donate_cvv_prompt_file) gather.play(audioBase + s.donate_cvv_prompt_file);
-        else gather.say('Please enter the three or four digit security code on the back of your card.');
+        else gather.say('Please enter the day number you would like to sponsor, from 1 to 40, then press the pound key. To sponsor with no specific day, just press the pound key.');
         twiml.redirect('/webhook');
     } catch (e) { console.error('[donate/expiry]', e); twiml.say('Error.'); twiml.redirect('/webhook'); }
     res.type('text/xml').send(twiml.toString());
