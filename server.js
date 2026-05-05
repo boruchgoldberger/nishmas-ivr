@@ -1428,7 +1428,8 @@ app.get('/api/sponsorships/stats', async (req, res) => {
                 COUNT(*) FILTER (WHERE status='approved') AS approved_count,
                 COUNT(*) FILTER (WHERE status='approved' AND sponsor_type='full') AS full_count,
                 COUNT(*) FILTER (WHERE status='approved' AND sponsor_type='partial') AS partial_count,
-                COUNT(*) FILTER (WHERE status='declined') AS declined_count
+                COUNT(*) FILTER (WHERE status='declined') AS declined_count,
+                COUNT(DISTINCT day_number) FILTER (WHERE status='approved' AND day_number IS NOT NULL) AS days_sponsored
             FROM sponsorships
         `);
         res.json(r.rows[0]);
@@ -1442,31 +1443,55 @@ app.delete('/api/sponsorships/:id', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: per-day availability map (1-40)
-app.get('/api/sponsorships/day-map', async (req, res) => {
+// Admin: per-day availability — shaped for the admin grid (days[]: { day, past, skip, blocked, full, partials })
+app.get('/api/sponsorships/by-day', async (req, res) => {
     try {
+        // Sponsorships grouped by day + type
         const r = await pool.query(`
             SELECT day_number, sponsor_type, COUNT(*) AS c
             FROM sponsorships WHERE status='approved' AND day_number IS NOT NULL
             GROUP BY day_number, sponsor_type
         `);
-        const map = {};
+        const sponsorMap = {};
         for (const row of r.rows) {
-            if (!map[row.day_number]) map[row.day_number] = { full: false, partial: 0 };
-            if (row.sponsor_type === 'full') map[row.day_number].full = true;
-            if (row.sponsor_type === 'partial') map[row.day_number].partial = parseInt(row.c) || 0;
+            const d = parseInt(row.day_number);
+            if (!sponsorMap[d]) sponsorMap[d] = { full: false, partials: 0 };
+            if (row.sponsor_type === 'full') sponsorMap[d].full = true;
+            if (row.sponsor_type === 'partial') sponsorMap[d].partials = parseInt(row.c) || 0;
         }
-        const blocked = await pool.query('SELECT * FROM sponsor_day_blocks');
+        // Admin-blocked days
+        const blockedRes = await pool.query('SELECT * FROM sponsor_day_blocks');
         const blockedMap = {};
-        for (const row of blocked.rows) blockedMap[row.day_number] = row.reason || 'shabbos';
-        res.json({ map, blocked: blockedMap });
+        for (const row of blockedRes.rows) blockedMap[parseInt(row.day_number)] = row.reason || 'shabbos';
+        // Skip days from messages table
+        const skipRes = await pool.query('SELECT day_number FROM nishmas_messages WHERE is_skip_day=true');
+        const skipSet = new Set(skipRes.rows.map(r => parseInt(r.day_number)));
+        // Current program day (for marking past)
+        const currentDay = await getCurrentProgramDay();
+
+        const days = [];
+        for (let d = 1; d <= 40; d++) {
+            const sp = sponsorMap[d] || { full: false, partials: 0 };
+            days.push({
+                day: d,
+                past: currentDay && d < currentDay,
+                skip: skipSet.has(d),
+                blocked: !!blockedMap[d],
+                blocked_reason: blockedMap[d] || null,
+                full: sp.full,
+                partials: sp.partials
+            });
+        }
+        res.json({ days });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Admin: block/unblock a day (e.g. mark Shabbos)
-app.post('/api/sponsorships/block-day/:day', async (req, res) => {
+// Accepts day in URL (/block-day/3) or body ({day_number:3})
+app.post('/api/sponsorships/block-day/:day?', async (req, res) => {
     try {
-        const day = parseInt(req.params.day);
+        const day = parseInt(req.params.day || req.body?.day_number);
+        if (!day || day < 1 || day > 40) return res.status(400).json({ error: 'Invalid day' });
         const reason = (req.body && req.body.reason) || 'shabbos';
         await pool.query(
             'INSERT INTO sponsor_day_blocks (day_number, reason) VALUES ($1,$2) ON CONFLICT (day_number) DO UPDATE SET reason=$2',
@@ -2900,6 +2925,164 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
           </div>
         </div>
 
+        <!-- ─────── SPONSOR A VIDEO ─────── -->
+        <h3 style="margin-top:30px;color:#7c3aed;">🎬 Sponsor A Video (Press 9)</h3>
+        <p style="color:#64748b;font-size:14px;margin:5px 0 15px;">Caller can sponsor a video — full ($500) or partial ($180), optionally tied to a specific day. After charge they choose anonymous or record their name.</p>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:15px;margin-bottom:20px;background:#faf5ff;padding:18px;border-radius:8px;border:1px solid #d8b4fe;">
+          <div class="form-group" style="margin:0;">
+            <label>Sponsor Enabled</label>
+            <select name="sponsor_enabled" id="sponsorEnabled" style="padding:8px;border-radius:6px;border:1px solid #cbd5e1;">
+              <option value="true">Yes — show in menu</option>
+              <option value="false">No — hide</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label>Menu Digit</label>
+            <input type="text" name="sponsor_digit" id="sponsorDigit" maxlength="1" pattern="[0-9]" style="padding:8px;border-radius:6px;border:1px solid #cbd5e1;" placeholder="9">
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label>Full Sponsor ($)</label>
+            <input type="number" name="sponsor_full_amount_dollars" id="sponsorFullAmount" min="1" step="1" style="padding:8px;border-radius:6px;border:1px solid #cbd5e1;" placeholder="500">
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label>Partial Sponsor ($)</label>
+            <input type="number" name="sponsor_partial_amount_dollars" id="sponsorPartialAmount" min="1" step="1" style="padding:8px;border-radius:6px;border:1px solid #cbd5e1;" placeholder="180">
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label>Max Partials/Day</label>
+            <input type="number" name="sponsor_partial_max_per_day" id="sponsorPartialMax" min="1" max="10" step="1" style="padding:8px;border-radius:6px;border:1px solid #cbd5e1;" placeholder="3">
+          </div>
+        </div>
+
+        <div class="form-grid">
+          <div class="form-group">
+            <label>1. Sponsor Intro Prompt</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "To sponsor a daily video that will be a source of chizuk for tens of thousands across the globe, press 1 to fully sponsor for $500, press 2 to partially sponsor for $180"</p>
+            <div class="upload-area" id="sponsorIntroArea">
+              <div class="upload-icon">🎬</div>
+              <div class="upload-text">Upload sponsor intro prompt</div>
+              <input type="file" id="sponsorIntroAudio" name="sponsor_intro_audio" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="sponsorIntroAudio" data-area="sponsorIntroArea" data-preview="sponsorIntroPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="sponsorIntroPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="sponsorIntroAudio" data-preview="sponsorIntroPreview" data-area="sponsorIntroArea">🗑️</button></div></div>
+            <div id="current-sponsorIntro"></div>
+          </div>
+
+          <div class="form-group">
+            <label>2. Pick Day Prompt</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "Please select a day from 1 to 40 to sponsor, or press # for no specific day"</p>
+            <div class="upload-area" id="sponsorPickDayArea">
+              <div class="upload-icon">📅</div>
+              <div class="upload-text">Upload pick-day prompt</div>
+              <input type="file" id="sponsorPickDayPrompt" name="sponsor_pick_day_prompt" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="sponsorPickDayPrompt" data-area="sponsorPickDayArea" data-preview="sponsorPickDayPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="sponsorPickDayPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="sponsorPickDayPrompt" data-preview="sponsorPickDayPreview" data-area="sponsorPickDayArea">🗑️</button></div></div>
+            <div id="current-sponsorPickDay"></div>
+          </div>
+
+          <div class="form-group">
+            <label>3. Day Already Taken</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "That day is already fully sponsored. Please choose another day."</p>
+            <div class="upload-area" id="sponsorDayTakenArea">
+              <div class="upload-icon">🚫</div>
+              <div class="upload-text">Upload day-taken message</div>
+              <input type="file" id="sponsorDayTaken" name="sponsor_day_taken_audio" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="sponsorDayTaken" data-area="sponsorDayTakenArea" data-preview="sponsorDayTakenPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="sponsorDayTakenPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="sponsorDayTaken" data-preview="sponsorDayTakenPreview" data-area="sponsorDayTakenArea">🗑️</button></div></div>
+            <div id="current-sponsorDayTaken"></div>
+          </div>
+
+          <div class="form-group">
+            <label>4. Shabbos Day Message</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "There is no video on Shabbos. Please choose another day."</p>
+            <div class="upload-area" id="sponsorShabbosArea">
+              <div class="upload-icon">🕊</div>
+              <div class="upload-text">Upload Shabbos message</div>
+              <input type="file" id="sponsorShabbos" name="sponsor_shabbos_audio" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="sponsorShabbos" data-area="sponsorShabbosArea" data-preview="sponsorShabbosPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="sponsorShabbosPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="sponsorShabbos" data-preview="sponsorShabbosPreview" data-area="sponsorShabbosArea">🗑️</button></div></div>
+            <div id="current-sponsorShabbos"></div>
+          </div>
+
+          <div class="form-group">
+            <label>5. Past Day Message</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "That day has already passed. Please choose a future day."</p>
+            <div class="upload-area" id="sponsorPastDayArea">
+              <div class="upload-icon">⏪</div>
+              <div class="upload-text">Upload past-day message</div>
+              <input type="file" id="sponsorPastDay" name="sponsor_past_day_audio" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="sponsorPastDay" data-area="sponsorPastDayArea" data-preview="sponsorPastDayPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="sponsorPastDayPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="sponsorPastDay" data-preview="sponsorPastDayPreview" data-area="sponsorPastDayArea">🗑️</button></div></div>
+            <div id="current-sponsorPastDay"></div>
+          </div>
+
+          <div class="form-group">
+            <label>6. Anonymous/Name Prompt</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "Press 1 to sponsor anonymously, press 2 to record your name"</p>
+            <div class="upload-area" id="sponsorAnonymousArea">
+              <div class="upload-icon">🕶</div>
+              <div class="upload-text">Upload anonymous prompt</div>
+              <input type="file" id="sponsorAnonymous" name="sponsor_anonymous_prompt" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="sponsorAnonymous" data-area="sponsorAnonymousArea" data-preview="sponsorAnonymousPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="sponsorAnonymousPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="sponsorAnonymous" data-preview="sponsorAnonymousPreview" data-area="sponsorAnonymousArea">🗑️</button></div></div>
+            <div id="current-sponsorAnonymous"></div>
+          </div>
+
+          <div class="form-group">
+            <label>7. Record Name Prompt</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "Please record your name for the dedication after the beep, press # when done"</p>
+            <div class="upload-area" id="sponsorRecordNameArea">
+              <div class="upload-icon">🎤</div>
+              <div class="upload-text">Upload record-name prompt</div>
+              <input type="file" id="sponsorRecordName" name="sponsor_record_name_prompt" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="sponsorRecordName" data-area="sponsorRecordNameArea" data-preview="sponsorRecordNamePreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="sponsorRecordNamePreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="sponsorRecordName" data-preview="sponsorRecordNamePreview" data-area="sponsorRecordNameArea">🗑️</button></div></div>
+            <div id="current-sponsorRecordName"></div>
+          </div>
+
+          <div class="form-group">
+            <label>8. Sponsor Thank You</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">Plays after card approves</p>
+            <div class="upload-area" id="sponsorThankYouArea">
+              <div class="upload-icon">🙏</div>
+              <div class="upload-text">Upload thank you</div>
+              <input type="file" id="sponsorThankYou" name="sponsor_thank_you" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="sponsorThankYou" data-area="sponsorThankYouArea" data-preview="sponsorThankYouPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="sponsorThankYouPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="sponsorThankYou" data-preview="sponsorThankYouPreview" data-area="sponsorThankYouArea">🗑️</button></div></div>
+            <div id="current-sponsorThankYou"></div>
+          </div>
+
+          <div class="form-group">
+            <label>9. Sponsor Decline</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">Plays if card declines</p>
+            <div class="upload-area" id="sponsorDeclineArea">
+              <div class="upload-icon">❌</div>
+              <div class="upload-text">Upload decline message</div>
+              <input type="file" id="sponsorDecline" name="sponsor_decline" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="sponsorDecline" data-area="sponsorDeclineArea" data-preview="sponsorDeclinePreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="sponsorDeclinePreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="sponsorDecline" data-preview="sponsorDeclinePreview" data-area="sponsorDeclineArea">🗑️</button></div></div>
+            <div id="current-sponsorDecline"></div>
+          </div>
+        </div>
+
         <button type="submit" class="btn btn-success btn-full">💾 Save All Audio Settings</button>
       </form>
 
@@ -3079,7 +3262,7 @@ async function loadSettings() {
     if (document.getElementById('donationEnabled')) {
       document.getElementById('donationEnabled').value = (currentSettings.donation_enabled === false) ? 'false' : 'true';
       document.getElementById('donationAmount').value = ((currentSettings.donation_amount_cents || 8000) / 100).toFixed(0);
-      document.getElementById('donationDigit').value = currentSettings.donation_digit || '9';
+      document.getElementById('donationDigit').value = currentSettings.kvittel_digit || currentSettings.donation_digit || '8';
       showCurrentAudio('donate_intro_audio_file', 'current-donateIntro', 'Current Donation Intro');
       showCurrentAudio('donate_card_prompt_file', 'current-donateCard', 'Current Card Prompt');
       showCurrentAudio('donate_expiry_prompt_file', 'current-donateExpiry', 'Current Expiry Prompt');
@@ -3089,7 +3272,26 @@ async function loadSettings() {
       showCurrentAudio('donate_kvittel_prompt_file', 'current-donateKvittel', 'Current Kvittel Prompt');
       showCurrentAudio('donate_kvittel_thank_file', 'current-donateKvittelThank', 'Current Kvittel Thank You');
     }
+
+    // Sponsor settings
+    if (document.getElementById('sponsorEnabled')) {
+      document.getElementById('sponsorEnabled').value = (currentSettings.sponsor_enabled === false) ? 'false' : 'true';
+      document.getElementById('sponsorDigit').value = currentSettings.sponsor_digit || '9';
+      document.getElementById('sponsorFullAmount').value = ((currentSettings.sponsor_full_amount_cents || 50000) / 100).toFixed(0);
+      document.getElementById('sponsorPartialAmount').value = ((currentSettings.sponsor_partial_amount_cents || 18000) / 100).toFixed(0);
+      document.getElementById('sponsorPartialMax').value = currentSettings.sponsor_partial_max_per_day || 3;
+      showCurrentAudio('sponsor_intro_audio_file', 'current-sponsorIntro', 'Current Sponsor Intro');
+      showCurrentAudio('sponsor_pick_day_prompt_file', 'current-sponsorPickDay', 'Current Pick-Day Prompt');
+      showCurrentAudio('sponsor_day_taken_audio_file', 'current-sponsorDayTaken', 'Current Day-Taken Message');
+      showCurrentAudio('sponsor_shabbos_audio_file', 'current-sponsorShabbos', 'Current Shabbos Message');
+      showCurrentAudio('sponsor_past_day_audio_file', 'current-sponsorPastDay', 'Current Past-Day Message');
+      showCurrentAudio('sponsor_anonymous_prompt_file', 'current-sponsorAnonymous', 'Current Anonymous Prompt');
+      showCurrentAudio('sponsor_record_name_prompt_file', 'current-sponsorRecordName', 'Current Record-Name Prompt');
+      showCurrentAudio('sponsor_thank_you_file', 'current-sponsorThankYou', 'Current Thank You');
+      showCurrentAudio('sponsor_decline_file', 'current-sponsorDecline', 'Current Decline Message');
+    }
     loadDonations();
+    loadSponsorships();
   } catch (e) { console.error(e); }
 }
 
@@ -3531,10 +3733,23 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
   const donationEnabledEl = document.getElementById('donationEnabled');
   if (donationEnabledEl) {
     fd.append('donation_enabled', donationEnabledEl.value);
-    const dollars = parseFloat(document.getElementById('donationAmount').value || '40');
+    const dollars = parseFloat(document.getElementById('donationAmount').value || '80');
     fd.append('donation_amount_cents', String(Math.round(dollars * 100)));
-    const digit = (document.getElementById('donationDigit').value || '9').trim();
-    if (/^[0-9]$/.test(digit)) fd.append('donation_digit', digit);
+    const digit = (document.getElementById('donationDigit').value || '8').trim();
+    if (/^[0-9]$/.test(digit)) fd.append('kvittel_digit', digit);
+  }
+  // Sponsor non-audio settings
+  const sponsorEnabledEl = document.getElementById('sponsorEnabled');
+  if (sponsorEnabledEl) {
+    fd.append('sponsor_enabled', sponsorEnabledEl.value);
+    const sDigit = (document.getElementById('sponsorDigit').value || '9').trim();
+    if (/^[0-9]$/.test(sDigit)) fd.append('sponsor_digit', sDigit);
+    const fullD = parseFloat(document.getElementById('sponsorFullAmount').value || '500');
+    fd.append('sponsor_full_amount_cents', String(Math.round(fullD * 100)));
+    const partD = parseFloat(document.getElementById('sponsorPartialAmount').value || '180');
+    fd.append('sponsor_partial_amount_cents', String(Math.round(partD * 100)));
+    const maxP = parseInt(document.getElementById('sponsorPartialMax').value || '3');
+    fd.append('sponsor_partial_max_per_day', String(maxP));
   }
   [
     ['greetingAudio', 'greeting_audio'],
@@ -3554,7 +3769,17 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     ['donateThankYou', 'donate_thank_you'],
     ['donateDecline', 'donate_decline'],
     ['donateKvittelPrompt', 'donate_kvittel_prompt'],
-    ['donateKvittelThank', 'donate_kvittel_thank']
+    ['donateKvittelThank', 'donate_kvittel_thank'],
+    // Sponsor prompts
+    ['sponsorIntroAudio', 'sponsor_intro_audio'],
+    ['sponsorPickDayPrompt', 'sponsor_pick_day_prompt'],
+    ['sponsorDayTaken', 'sponsor_day_taken_audio'],
+    ['sponsorShabbos', 'sponsor_shabbos_audio'],
+    ['sponsorPastDay', 'sponsor_past_day_audio'],
+    ['sponsorAnonPrompt', 'sponsor_anonymous_prompt'],
+    ['sponsorRecordName', 'sponsor_record_name_prompt'],
+    ['sponsorThankYou', 'sponsor_thank_you'],
+    ['sponsorDecline', 'sponsor_decline']
   ].forEach(([inputId, fieldName]) => {
     const el = document.getElementById(inputId);
     if (!el) return;
@@ -3567,6 +3792,7 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
       showAlert('settings-alert', 'Settings saved!', 'success');
       document.querySelectorAll('.recorded-preview').forEach(p => p.classList.remove('active'));
       loadSettings();
+      loadSponsorships();
     }
     else showAlert('settings-alert', 'Error saving', 'error');
   } catch (err) { showAlert('settings-alert', 'Error: ' + err.message, 'error'); }
