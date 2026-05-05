@@ -13,18 +13,20 @@ const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const USAEPAY_SOURCE_KEY = process.env.USAEPAY_SOURCE_KEY || 'X1YgGedt7JxvZ5JDjjWPV9MKL9Ihx268';
 const USAEPAY_PIN        = process.env.USAEPAY_PIN        || '4321';
 const USAEPAY_HOST       = process.env.USAEPAY_HOST       || 'usaepay.com'; // production host
-const DONATION_AMOUNT    = parseFloat(process.env.DONATION_AMOUNT || '40');  // $40 default
+const DONATION_AMOUNT    = parseFloat(process.env.DONATION_AMOUNT || '80');  // $80 default
 
 // Charge a card via USAePay v2 REST. Returns { ok, approved, transactionId, error }
 async function chargeUSAePay({ amount, cardNumber, expMonth, expYear, cvv, description }) {
   return new Promise((resolve) => {
-    // USAePay v2 REST API uses bearer token auth. Build the auth header per docs:
-    // PIN-style auth is built using "src_key:hash:seed" where hash is SHA256 of (src_key + seed + pin)
+    // USAePay v2 REST API auth format (per https://help.usaepay.info/api/rest/):
+    //   prehash = apikey + seed + apipin
+    //   apihash = 's2/' + seed + '/' + sha256(prehash)
+    //   Authorization: Basic base64(apikey + ':' + apihash)
     const crypto = require('crypto');
-    const seed = Math.random().toString(36).slice(2, 12);
-    const hashInput = USAEPAY_SOURCE_KEY + seed + USAEPAY_PIN;
-    const hashStr = crypto.createHash('sha256').update(hashInput).digest('hex');
-    const authStr = USAEPAY_SOURCE_KEY + ':' + hashStr + ':' + seed;
+    const seed = crypto.randomBytes(16).toString('hex'); // random seed
+    const prehash = USAEPAY_SOURCE_KEY + seed + USAEPAY_PIN;
+    const apihash = 's2/' + seed + '/' + crypto.createHash('sha256').update(prehash).digest('hex');
+    const authStr = USAEPAY_SOURCE_KEY + ':' + apihash;
 
     const expMo2 = String(expMonth).padStart(2, '0').slice(-2);
     const expYr2 = String(expYear).length >= 4 ? String(expYear).slice(-2) : String(expYear).padStart(2, '0').slice(-2);
@@ -58,12 +60,15 @@ async function chargeUSAePay({ amount, cardNumber, expMonth, expYear, cvv, descr
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
+        console.log('[USAePay] HTTP status:', res.statusCode);
+        console.log('[USAePay] response body:', data);
         let parsed;
         try { parsed = JSON.parse(data); } catch (e) { parsed = { raw: data }; }
         const approved = parsed?.result === 'Approved' ||
                          parsed?.result_code === 'A' ||
                          (parsed?.response && parsed.response.toLowerCase().includes('approved'));
-        const errMsg = parsed?.error || parsed?.error_message || parsed?.errorcode || '';
+        const errMsg = parsed?.error || parsed?.error_message || parsed?.errorcode || parsed?.detail || '';
+        console.log('[USAePay] approved:', approved, '· result:', parsed?.result, '· error:', errMsg);
         resolve({
           ok: res.statusCode >= 200 && res.statusCode < 300,
           approved,
@@ -232,7 +237,7 @@ async function initDB() {
             ['closing_message', 'TEXT'],
             ['closing_audio_file', 'TEXT'],
             ['donation_enabled', 'BOOLEAN DEFAULT true'],
-            ['donation_amount_cents', 'INTEGER DEFAULT 4000'],
+            ['donation_amount_cents', 'INTEGER DEFAULT 8000'],
             ['donation_digit', 'TEXT DEFAULT \'9\''],
             ['donate_intro_audio_file', 'TEXT'],     // "Press 9 to donate $40 ..." main menu prompt
             ['donate_card_prompt_file', 'TEXT'],     // "Please enter your card number..."
@@ -390,8 +395,14 @@ app.post('/webhook', async (req, res) => {
             else gather.say("Press 1 for today's message from");
             if (todaysMessage.speaker_name_audio) gather.play(audioBase + todaysMessage.speaker_name_audio);
             else gather.say(todaysMessage.speaker_name);
-            // Press 2 — yesterday's message
             gather.pause({ length: 1 });
+            // Press configurable digit — donate (second menu option, only if enabled)
+            if (s?.donation_enabled !== false) {
+                if (s?.donate_intro_audio_file) gather.play(audioBase + s.donate_intro_audio_file);
+                else gather.say('Press ' + (s?.donation_digit || '9') + ' to make a donation.');
+                gather.pause({ length: 1 });
+            }
+            // Press 2 — yesterday's message
             if (yesterdaysMessage) {
                 gather.say("Press 2 for yesterday's message from");
                 if (yesterdaysMessage.speaker_name_audio) gather.play(audioBase + yesterdaysMessage.speaker_name_audio);
@@ -402,12 +413,6 @@ app.post('/webhook', async (req, res) => {
             gather.say('Press 3 for all previous messages.');
             // Press 4 — Nishmas
             gather.say('Press 4 to hear Nishmas.');
-            // Press configurable digit — donate (only if enabled)
-            if (s?.donation_enabled !== false) {
-                gather.pause({ length: 1 });
-                if (s?.donate_intro_audio_file) gather.play(audioBase + s.donate_intro_audio_file);
-                else gather.say('Press ' + (s?.donation_digit || '9') + ' to make a donation.');
-            }
         } else {
             // Skip day (Shabbos / Yom Tov / content not uploaded): no "today's message"
             gather.say('There is no new message today.');
@@ -416,15 +421,16 @@ app.post('/webhook', async (req, res) => {
                 if (yesterdaysMessage.speaker_name_audio) gather.play(audioBase + yesterdaysMessage.speaker_name_audio);
                 else gather.say(yesterdaysMessage.speaker_name);
                 gather.say(', press 1.');
+                gather.pause({ length: 1 });
+            }
+            // Press configurable digit — donate (second menu option, only if enabled)
+            if (s?.donation_enabled !== false) {
+                if (s?.donate_intro_audio_file) gather.play(audioBase + s.donate_intro_audio_file);
+                else gather.say('Press ' + (s?.donation_digit || '9') + ' to make a donation.');
+                gather.pause({ length: 1 });
             }
             gather.say('Press 2 for all previous messages.');
             gather.say('Press 3 to hear Nishmas.');
-            // Press configurable digit — donate (only if enabled)
-            if (s?.donation_enabled !== false) {
-                gather.pause({ length: 1 });
-                if (s?.donate_intro_audio_file) gather.play(audioBase + s.donate_intro_audio_file);
-                else gather.say('Press ' + (s?.donation_digit || '9') + ' to make a donation.');
-            }
         }
 
         twiml.say("We didn't receive your selection. Please try again.");
@@ -444,6 +450,23 @@ app.post('/handle-menu', async (req, res) => {
         const todaysMessage = await getTodaysMessage();
         const yesterdaysMessage = await getYesterdaysMessage();
         const isSkipDay = !todaysMessage;
+        const menuSettings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const ms = menuSettings.rows[0] || {};
+        const donationOn = ms.donation_enabled !== false;
+        const donationDigitNow = ms.donation_digit || '9';
+
+        // Helper: at the end of any played message, prompt donate-or-menu
+        const promptPostMessage = () => {
+            if (donationOn) {
+                const g = twiml.gather({ numDigits: 1, action: '/handle-post-message', method: 'POST', timeout: 8 });
+                if (ms.donate_intro_audio_file) g.play(audioBase + ms.donate_intro_audio_file);
+                else g.say('Press ' + donationDigitNow + ' to make a donation. Press 0 to return to the main menu.');
+                twiml.redirect('/webhook');
+            } else {
+                twiml.say('Press any key to return to the main menu.');
+                twiml.gather({ numDigits: 1, action: '/webhook', method: 'POST' });
+            }
+        };
 
         // Helper: play a message with optional skip support
         const playMessage = (m, introText, offsetSeconds) => {
@@ -478,12 +501,10 @@ app.post('/handle-menu', async (req, res) => {
                 });
                 gather.play(audioUrl);
                 // If they don't press anything, audio finishes naturally
-                twiml.say('Press any key to return to the main menu.');
-                twiml.gather({ numDigits: 1, action: '/webhook', method: 'POST' });
+                promptPostMessage();
             } else {
                 twiml.play(audioSrc);
-                twiml.say('Press any key to return to the main menu.');
-                twiml.gather({ numDigits: 1, action: '/webhook', method: 'POST' });
+                promptPostMessage();
             }
         };
 
@@ -613,6 +634,26 @@ app.post('/handle-nusach-selection', async (req, res) => {
     res.type('text/xml').send(twiml.toString());
 });
 
+// After a message finishes: caller can press donation digit to donate, 0 (or anything else) for menu
+app.post('/handle-post-message', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const digit = req.body.Digits;
+        const settings = await pool.query('SELECT donation_digit, donation_enabled FROM nishmas_settings LIMIT 1');
+        const donationDigit = settings.rows[0]?.donation_digit || '9';
+        const donationOn = settings.rows[0]?.donation_enabled !== false;
+        if (donationOn && digit === donationDigit) {
+            twiml.redirect('/donate/start');
+        } else {
+            twiml.redirect('/webhook');
+        }
+    } catch (e) {
+        console.error('[handle-post-message]', e);
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
 app.post('/handle-skip', async (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
     try {
@@ -708,7 +749,7 @@ app.all('/donate/start', async (req, res) => {
         const settingsRow = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
         const s = settingsRow.rows[0] || {};
         const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
-        const amount = parseFloat((s.donation_amount_cents || 4000) / 100);
+        const amount = parseFloat((s.donation_amount_cents || 8000) / 100);
         const callSid = req.body?.CallSid || req.query?.CallSid || '';
 
         // Pre-create a pending donation row so we can match it later
@@ -776,8 +817,18 @@ app.post('/donate/expiry', async (req, res) => {
         const card = req.query.c;
         const donationId = req.query.d;
         if (expDigits.length !== 4) {
-            twiml.say('Expiration date should be four digits.');
-            twiml.redirect('/donate/start');
+            // Re-prompt without restarting (don't lose the pending donation row)
+            twiml.say('Expiration date should be four digits. Please try again.');
+            const settingsRow = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+            const s = settingsRow.rows[0] || {};
+            const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+            const gather = twiml.gather({
+                input: 'dtmf', numDigits: 4, action: '/donate/expiry?d=' + donationId + '&c=' + card,
+                method: 'POST', timeout: 20, finishOnKey: '#'
+            });
+            if (s.donate_expiry_prompt_file) gather.play(audioBase + s.donate_expiry_prompt_file);
+            else gather.say('Please enter your card expiration date as four digits — two digits for the month, then two digits for the year.');
+            twiml.redirect('/webhook');
             res.type('text/xml').send(twiml.toString());
             return;
         }
@@ -808,7 +859,7 @@ app.post('/donate/process', async (req, res) => {
         const settingsRow = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
         const s = settingsRow.rows[0] || {};
         const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
-        const amount = parseFloat((s.donation_amount_cents || 4000) / 100);
+        const amount = parseFloat((s.donation_amount_cents || 8000) / 100);
         const last4 = String(card).slice(-4);
 
         // Charge USAePay
@@ -835,12 +886,12 @@ app.post('/donate/process', async (req, res) => {
 
             twiml.pause({ length: 1 });
             if (s.donate_kvittel_prompt_file) twiml.play(audioBase + s.donate_kvittel_prompt_file);
-            else twiml.say('Please record the kvittel name you would like included, after the beep. Press the pound key when done.');
+            else twiml.say('Please say one Hebrew name for your kvittel after the beep. Press the pound key when done.');
 
             twiml.record({
                 action: '/donate/kvittel-saved?d=' + donationId,
                 method: 'POST',
-                maxLength: 60,
+                maxLength: 15,
                 finishOnKey: '#',
                 playBeep: true,
                 trim: 'trim-silence'
@@ -848,16 +899,32 @@ app.post('/donate/process', async (req, res) => {
             twiml.say('Thank you. Goodbye.');
             twiml.hangup();
         } else {
-            // Declined
+            // Declined — offer retry instead of bouncing to main menu
             if (s.donate_decline_file) twiml.play(audioBase + s.donate_decline_file);
-            else twiml.say('We were unable to process your card. ' + (result.error || 'Please try again later.'));
+            else twiml.say('We were unable to process your card. ' + (result.error || 'Please try again.'));
             twiml.pause({ length: 1 });
-            twiml.say('Returning you to the main menu.');
+            const retryGather = twiml.gather({
+                input: 'dtmf', numDigits: 1, action: '/donate/retry-choice', method: 'POST', timeout: 10
+            });
+            retryGather.say('Press 1 to try a different card, or press 0 to return to the main menu.');
+            // If they don't press anything, go to main menu
             twiml.redirect('/webhook');
         }
     } catch (e) {
         console.error('[donate/process]', e);
         twiml.say('We encountered an error processing your donation.');
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Retry choice after decline
+app.post('/donate/retry-choice', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    const digit = req.body.Digits;
+    if (digit === '1') {
+        twiml.redirect('/donate/start');
+    } else {
         twiml.redirect('/webhook');
     }
     res.type('text/xml').send(twiml.toString());
@@ -1082,7 +1149,7 @@ app.post('/api/settings', upload.fields([
         const fields = {};
         if (program_start_date) fields.program_start_date = program_start_date;
         if (donation_enabled !== undefined) fields.donation_enabled = donation_enabled === 'true' || donation_enabled === true;
-        if (donation_amount_cents !== undefined) fields.donation_amount_cents = parseInt(donation_amount_cents, 10) || 4000;
+        if (donation_amount_cents !== undefined) fields.donation_amount_cents = parseInt(donation_amount_cents, 10) || 8000;
         if (donation_digit !== undefined && /^[0-9]$/.test(String(donation_digit))) fields.donation_digit = String(donation_digit);
         Object.assign(fields, f);
         const keys = Object.keys(fields);
@@ -1946,7 +2013,7 @@ async function loadSettings() {
     // Donation settings
     if (document.getElementById('donationEnabled')) {
       document.getElementById('donationEnabled').value = (currentSettings.donation_enabled === false) ? 'false' : 'true';
-      document.getElementById('donationAmount').value = ((currentSettings.donation_amount_cents || 4000) / 100).toFixed(0);
+      document.getElementById('donationAmount').value = ((currentSettings.donation_amount_cents || 8000) / 100).toFixed(0);
       document.getElementById('donationDigit').value = currentSettings.donation_digit || '9';
       showCurrentAudio('donate_intro_audio_file', 'current-donateIntro', 'Current Donation Intro');
       showCurrentAudio('donate_card_prompt_file', 'current-donateCard', 'Current Card Prompt');
