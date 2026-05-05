@@ -1094,9 +1094,7 @@ app.all('/sponsor/start', async (req, res) => {
         const partAmt = ((s.sponsor_partial_amount_cents || 18000) / 100).toFixed(0);
 
         const gather = twiml.gather({ numDigits: 1, action: '/sponsor/type-chosen', method: 'POST', timeout: 10 });
-        if (s.sponsor_intro_audio_file) gather.play(audioBase + s.sponsor_intro_audio_file);
-        else gather.say('To sponsor a daily video that will be a source of chizuk for tens of thousands across the globe.');
-        gather.pause({ length: 1 });
+        
         gather.say('To fully sponsor a video for ' + fullAmt + ' dollars, press 1.');
         gather.say('To partially sponsor a video for ' + partAmt + ' dollars, press 2.');
         twiml.redirect('/webhook');
