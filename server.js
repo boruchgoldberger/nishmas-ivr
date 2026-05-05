@@ -9,72 +9,79 @@ const https = require('https');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 
-// ── Sola Payments credentials ───────────────────────────────────────────────
-// Set SOLA_KEY in Railway env vars (your xKey from the Sola merchant portal).
-const SOLA_KEY            = process.env.SOLA_KEY            || '996jI7CEk55YgDan1C208Z1ZSETzMA4I';
-const SOLA_HOST           = process.env.SOLA_HOST           || 'x1.cardknox.com'; // x1=primary, x2/b1=backup
-const SOLA_SOFTWARE_NAME  = process.env.SOLA_SOFTWARE_NAME  || 'NishmasIVR';
-const SOLA_SOFTWARE_VER   = process.env.SOLA_SOFTWARE_VER   || '1.0.0';
-const DONATION_AMOUNT     = parseFloat(process.env.DONATION_AMOUNT || '80'); // $80 default
+// ── USAePay credentials ─────────────────────────────────────────────────────
+const USAEPAY_SOURCE_KEY = process.env.USAEPAY_SOURCE_KEY || 'X1YgGedt7JxvZ5JDjjWPV9MKL9Ihx268';
+const USAEPAY_PIN        = process.env.USAEPAY_PIN        || '4321';
+const USAEPAY_HOST       = process.env.USAEPAY_HOST       || 'usaepay.com';
+const DONATION_AMOUNT    = parseFloat(process.env.DONATION_AMOUNT || '80');  // $80 kvittel default
+const SPONSOR_FULL_AMT   = parseFloat(process.env.SPONSOR_FULL_AMT || '500'); // full sponsor
+const SPONSOR_PARTIAL_AMT= parseFloat(process.env.SPONSOR_PARTIAL_AMT || '180'); // partial sponsor
 
-// Charge a card via Sola (Cardknox) gateway. Returns { ok, approved, transactionId, error }
-async function chargeSola({ amount, cardNumber, expMonth, expYear, cvv, description, invoice }) {
+// Charge a card via USAePay v2 REST. Returns { ok, approved, transactionId, error }
+async function chargeUSAePay({ amount, cardNumber, expMonth, expYear, cvv, description }) {
   return new Promise((resolve) => {
+    // USAePay v2 REST API auth format (per https://help.usaepay.info/api/rest/):
+    //   prehash = apikey + seed + apipin
+    //   apihash = 's2/' + seed + '/' + sha256(prehash)
+    //   Authorization: Basic base64(apikey + ':' + apihash)
+    const crypto = require('crypto');
+    const seed = crypto.randomBytes(16).toString('hex');
+    const prehash = USAEPAY_SOURCE_KEY + seed + USAEPAY_PIN;
+    const apihash = 's2/' + seed + '/' + crypto.createHash('sha256').update(prehash).digest('hex');
+    const authStr = USAEPAY_SOURCE_KEY + ':' + apihash;
+
     const expMo2 = String(expMonth).padStart(2, '0').slice(-2);
     const expYr2 = String(expYear).length >= 4 ? String(expYear).slice(-2) : String(expYear).padStart(2, '0').slice(-2);
 
     const body = JSON.stringify({
-      xKey: SOLA_KEY,
-      xVersion: '5.0.0',
-      xSoftwareName: SOLA_SOFTWARE_NAME,
-      xSoftwareVersion: SOLA_SOFTWARE_VER,
-      xCommand: 'cc:sale',
-      xAmount: parseFloat(amount).toFixed(2),
-      xCardNum: String(cardNumber).replace(/\D/g, ''),
-      xExp: expMo2 + expYr2,
-      xCVV: String(cvv).replace(/\D/g, ''),
-      xName: 'IVR Donor',
-      xDescription: description || 'Nishmas IVR Donation',
-      xInvoice: invoice || ('NISHMAS-' + Date.now()),
-      xAllowDuplicate: 'TRUE'
+      command: 'cc:sale',
+      amount: parseFloat(amount).toFixed(2),
+      creditcard: {
+        cardholder: 'IVR Donor',
+        number: String(cardNumber).replace(/\D/g, ''),
+        expiration: expMo2 + expYr2,
+        cvc: String(cvv).replace(/\D/g, '')
+      },
+      description: description || 'Nishmas IVR Donation',
+      ignore_duplicate: true
     });
 
     const options = {
-      hostname: SOLA_HOST,
-      path: '/gatewayjson',
+      hostname: USAEPAY_HOST,
+      path: '/api/v2/transactions',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body)
+        'Content-Length': Buffer.byteLength(body),
+        'Authorization': 'Basic ' + Buffer.from(authStr).toString('base64')
       }
     };
 
-    console.log('[Sola] charging $' + amount + ', card ending ' + String(cardNumber).slice(-4));
+    console.log('[USAePay] charging $' + amount + ', card ending ' + String(cardNumber).slice(-4));
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        console.log('[Sola] HTTP status:', res.statusCode);
-        console.log('[Sola] response body:', data);
+        console.log('[USAePay] HTTP status:', res.statusCode);
+        console.log('[USAePay] response body:', data);
         let parsed;
         try { parsed = JSON.parse(data); } catch (e) { parsed = { raw: data }; }
-        // Sola: xResult = 'A' (Approved), 'D' (Declined), 'E' (Error)
-        const approved = parsed?.xResult === 'A';
-        const errMsg = parsed?.xError || parsed?.xStatus || '';
-        console.log('[Sola] approved:', approved, '· status:', parsed?.xStatus, '· error:', errMsg);
+        const approved = parsed?.result === 'Approved' || parsed?.result_code === 'A';
+        const errMsg = parsed?.error || parsed?.error_message || parsed?.errorcode || parsed?.detail || '';
+        console.log('[USAePay] approved:', approved, '· result:', parsed?.result, '· error:', errMsg);
         resolve({
           ok: res.statusCode >= 200 && res.statusCode < 300,
           approved,
-          transactionId: parsed?.xRefNum || '',
-          authCode: parsed?.xAuthCode || '',
-          status: parsed?.xStatus || '',
+          transactionId: parsed?.refnum || parsed?.transaction_id || parsed?.key || '',
+          authCode: parsed?.authcode || '',
+          status: parsed?.result || '',
           error: errMsg,
           raw: parsed
         });
       });
     });
     req.on('error', (err) => {
-      console.error('[Sola] network error:', err.message);
+      console.error('[USAePay] network error:', err.message);
       resolve({ ok: false, approved: false, error: err.message });
     });
     req.write(body);
@@ -207,7 +214,9 @@ async function initDB() {
             ['program_date', 'TEXT'],
             ['is_active', 'BOOLEAN DEFAULT true'],
             ['created_at', 'TIMESTAMP DEFAULT NOW()'],
-            ['allow_skip', 'BOOLEAN DEFAULT false']
+            ['allow_skip', 'BOOLEAN DEFAULT false'],
+            ['dedication_audio_file', 'TEXT'],   // plays right after welcome on this message's playback (admin upload per-message)
+            ['is_skip_day', 'BOOLEAN DEFAULT false']  // Shabbos / Yom Tov — no video, can't be sponsored
         ];
         for (const [col, type] of msgCols) {
             await pool.query(`ALTER TABLE nishmas_messages ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
@@ -240,6 +249,22 @@ async function initDB() {
             ['donate_thank_you_file', 'TEXT'],       // "Thank you, your donation was approved..."
             ['donate_decline_file', 'TEXT'],         // "Your card was declined..."
             ['donate_kvittel_thank_file', 'TEXT'],   // "Thank you, your kvittel has been received..."
+            // ── Sponsor flow (Press 9) ──────────────────────────────────────
+            ['sponsor_enabled', 'BOOLEAN DEFAULT true'],
+            ['sponsor_digit', "TEXT DEFAULT '9'"],
+            ['kvittel_digit', "TEXT DEFAULT '8'"],     // Press 8 = kvittel/donate flow
+            ['sponsor_full_amount_cents', 'INTEGER DEFAULT 50000'],   // $500
+            ['sponsor_partial_amount_cents', 'INTEGER DEFAULT 18000'], // $180
+            ['sponsor_partial_max_per_day', 'INTEGER DEFAULT 3'],     // up to 3 partials per day
+            ['sponsor_intro_audio_file', 'TEXT'],          // "To sponsor a daily video that will be a source of chizuk... press 1 for full $500, press 2 for partial $180"
+            ['sponsor_pick_day_prompt_file', 'TEXT'],      // "Please select a day from 1 to 40, or press # for no specific day"
+            ['sponsor_day_taken_audio_file', 'TEXT'],      // "That day is already fully sponsored — please choose another day"
+            ['sponsor_shabbos_audio_file', 'TEXT'],        // "There is no video on Shabbos — please choose another day"
+            ['sponsor_past_day_audio_file', 'TEXT'],       // "That day has already passed — please choose a future day"
+            ['sponsor_anonymous_prompt_file', 'TEXT'],     // "Press 1 to sponsor anonymously, press 2 to record your name"
+            ['sponsor_record_name_prompt_file', 'TEXT'],   // "Please record your name after the beep, press # when done"
+            ['sponsor_thank_you_file', 'TEXT'],            // "Thank you, your sponsorship has been received..."
+            ['sponsor_decline_file', 'TEXT'],              // "Your card was declined for the sponsorship..."
             ['is_program_active', 'BOOLEAN DEFAULT true'],
             ['created_at', 'TIMESTAMP DEFAULT NOW()']
         ];
@@ -279,6 +304,55 @@ async function initDB() {
         for (const [col, type] of donCols) {
             await pool.query(`ALTER TABLE donations ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
         }
+
+        // Sponsorships table — full $500 or partial $180 sponsorships, optionally tied to a day
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS sponsorships (
+                id SERIAL PRIMARY KEY,
+                day_number INTEGER,                  -- 1-40 or NULL for "no specific day"
+                sponsor_type TEXT NOT NULL,           -- 'full' | 'partial'
+                amount_cents INTEGER NOT NULL,
+                sponsor_name TEXT,                    -- recorded name URL or typed name; null if anonymous
+                anonymous BOOLEAN DEFAULT false,
+                kvittel_recording_url TEXT,
+                card_last4 TEXT,
+                status TEXT DEFAULT 'pending',        -- 'approved' | 'declined' | 'pending' | 'error'
+                transaction_id TEXT,
+                auth_code TEXT,
+                decline_reason TEXT,
+                caller_phone TEXT,
+                ivr_call_sid TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `).catch(() => {});
+        const spCols = [
+            ['day_number', 'INTEGER'],
+            ['sponsor_type', 'TEXT'],
+            ['amount_cents', 'INTEGER'],
+            ['sponsor_name', 'TEXT'],
+            ['anonymous', 'BOOLEAN DEFAULT false'],
+            ['kvittel_recording_url', 'TEXT'],
+            ['card_last4', 'TEXT'],
+            ['status', "TEXT DEFAULT 'pending'"],
+            ['transaction_id', 'TEXT'],
+            ['auth_code', 'TEXT'],
+            ['decline_reason', 'TEXT'],
+            ['caller_phone', 'TEXT'],
+            ['ivr_call_sid', 'TEXT'],
+            ['created_at', 'TIMESTAMP DEFAULT NOW()']
+        ];
+        for (const [col, type] of spCols) {
+            await pool.query(`ALTER TABLE sponsorships ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
+        }
+
+        // Admin-blockable days — admin can mark any day 1-40 as blocked (no sponsorships allowed)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS sponsor_day_blocks (
+                day_number INTEGER PRIMARY KEY,
+                reason TEXT,
+                blocked_at TIMESTAMP DEFAULT NOW()
+            )
+        `).catch(() => {});
 
         const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
         if (settings.rows.length === 0) {
@@ -377,11 +451,24 @@ app.post('/webhook', async (req, res) => {
             gather.say('Welcome to the 40 Days of Nishmas program.');
         }
 
-        // 1b. Donation prompt — plays right after welcome, before menu options
-        if (s?.donation_enabled !== false) {
+        // 1b. Sponsor + Kvittel prompts — play right after welcome, before menu options
+        if (s?.sponsor_enabled !== false) {
             gather.pause({ length: 1 });
+            // Sponsor prompt (press 9 by default) — admin-uploadable intro about sponsoring a daily video
+            if (s?.sponsor_intro_audio_file) gather.play(audioBase + s.sponsor_intro_audio_file);
+            else gather.say('To sponsor a daily video that will be a source of chizuk for tens of thousands across the globe, press ' + (s?.sponsor_digit || '9') + '.');
+            gather.pause({ length: 1 });
+        }
+        if (s?.donation_enabled !== false) {
+            // Kvittel/donate prompt (press 8 by default)
             if (s?.donate_intro_audio_file) gather.play(audioBase + s.donate_intro_audio_file);
-            else gather.say('Press ' + (s?.donation_digit || '9') + ' to make a donation.');
+            else gather.say('To donate ' + ((s?.donation_amount_cents || 8000) / 100).toFixed(0) + ' dollars and have a kvittel said for you, press ' + (s?.kvittel_digit || '8') + '.');
+            gather.pause({ length: 1 });
+        }
+        if (s?.sponsor_enabled !== false) {
+            // Sponsor a video prompt (press 9 by default)
+            if (s?.sponsor_intro_audio_file) gather.play(audioBase + s.sponsor_intro_audio_file);
+            else gather.say('To sponsor a daily video that will be a source of chizuk for tens of thousands across the globe, press ' + (s?.sponsor_digit || '9') + '.');
             gather.pause({ length: 1 });
         }
 
@@ -442,14 +529,20 @@ app.post('/handle-menu', async (req, res) => {
         const menuSettings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
         const ms = menuSettings.rows[0] || {};
         const donationOn = ms.donation_enabled !== false;
-        const donationDigitNow = ms.donation_digit || '9';
+        const sponsorOn = ms.sponsor_enabled !== false;
+        const kvittelDigitNow = ms.kvittel_digit || ms.donation_digit || '8';
+        const sponsorDigitNow = ms.sponsor_digit || '9';
 
-        // Helper: at the end of any played message, prompt donate-or-menu
+        // Helper: at the end of any played message, prompt sponsor / kvittel / menu
         const promptPostMessage = () => {
-            if (donationOn) {
-                const g = twiml.gather({ numDigits: 1, action: '/handle-post-message', method: 'POST', timeout: 8 });
-                if (ms.donate_intro_audio_file) g.play(audioBase + ms.donate_intro_audio_file);
-                else g.say('Press ' + donationDigitNow + ' to make a donation. Press 0 to return to the main menu.');
+            if (sponsorOn || donationOn) {
+                const g = twiml.gather({ numDigits: 1, action: '/handle-post-message', method: 'POST', timeout: 10 });
+                // Play uploaded prompts first if available
+                if (sponsorOn && ms.sponsor_intro_audio_file) g.play(audioBase + ms.sponsor_intro_audio_file);
+                else if (sponsorOn) g.say('To sponsor a daily video, press ' + sponsorDigitNow + '.');
+                if (donationOn && ms.donate_intro_audio_file) g.play(audioBase + ms.donate_intro_audio_file);
+                else if (donationOn) g.say('To donate ' + ((ms.donation_amount_cents || 8000) / 100).toFixed(0) + ' dollars and have a kvittel said for you, press ' + kvittelDigitNow + '.');
+                g.say('Press 0 to return to the main menu.');
                 twiml.redirect('/webhook');
             } else {
                 twiml.say('Press any key to return to the main menu.');
@@ -459,6 +552,11 @@ app.post('/handle-menu', async (req, res) => {
 
         // Helper: play a message with optional skip support
         const playMessage = (m, introText, offsetSeconds) => {
+            // Dedication audio (uploaded per message) — plays right before the message intro
+            if (m.dedication_audio_file && (!offsetSeconds || offsetSeconds === 0)) {
+                twiml.play(audioBase + m.dedication_audio_file);
+                twiml.pause({ length: 1 });
+            }
             twiml.say(introText + ' from');
             if (m.speaker_name_audio) twiml.play(audioBase + m.speaker_name_audio);
             else twiml.say(m.speaker_name);
@@ -548,12 +646,21 @@ app.post('/handle-menu', async (req, res) => {
         };
 
         // --- MENU ROUTING ---
-        // Regular day: 1=today, 2=yesterday, 3=all, 4=nishmas, 9=donate (configurable)
-        // Skip day:    1=yesterday, 2=all, 3=nishmas, 9=donate
-        const settingsForRoute = await pool.query('SELECT donation_digit, donation_enabled FROM nishmas_settings LIMIT 1');
-        const donationDigit = settingsForRoute.rows[0]?.donation_digit || '9';
-        const donationEnabled = settingsForRoute.rows[0]?.donation_enabled !== false;
-        if (donationEnabled && digit === donationDigit) {
+        // Regular day: 1=today, 2=yesterday, 3=all, 4=nishmas
+        // Press 8 (kvittel_digit) = donate $80 + kvittel; Press 9 (sponsor_digit) = sponsor a video
+        const settingsForRoute = await pool.query('SELECT donation_digit, kvittel_digit, donation_enabled, sponsor_digit, sponsor_enabled FROM nishmas_settings LIMIT 1');
+        const sRoute = settingsForRoute.rows[0] || {};
+        // kvittel_digit takes precedence; fall back to legacy donation_digit
+        const kvittelDigit = sRoute.kvittel_digit || sRoute.donation_digit || '8';
+        const donationEnabled = sRoute.donation_enabled !== false;
+        const sponsorDigit = sRoute.sponsor_digit || '9';
+        const sponsorEnabled = sRoute.sponsor_enabled !== false;
+        if (sponsorEnabled && digit === sponsorDigit) {
+            twiml.redirect('/sponsor/start');
+            res.type('text/xml').send(twiml.toString());
+            return;
+        }
+        if (donationEnabled && digit === kvittelDigit) {
             twiml.redirect('/donate/start');
             res.type('text/xml').send(twiml.toString());
             return;
@@ -623,15 +730,18 @@ app.post('/handle-nusach-selection', async (req, res) => {
     res.type('text/xml').send(twiml.toString());
 });
 
-// After a message finishes: caller can press donation digit to donate, 0 (or anything else) for menu
+// After a message finishes: caller can press kvittel/sponsor digit, or anything else for menu
 app.post('/handle-post-message', async (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
     try {
         const digit = req.body.Digits;
-        const settings = await pool.query('SELECT donation_digit, donation_enabled FROM nishmas_settings LIMIT 1');
-        const donationDigit = settings.rows[0]?.donation_digit || '9';
-        const donationOn = settings.rows[0]?.donation_enabled !== false;
-        if (donationOn && digit === donationDigit) {
+        const settings = await pool.query('SELECT donation_digit, kvittel_digit, donation_enabled, sponsor_digit, sponsor_enabled FROM nishmas_settings LIMIT 1');
+        const r = settings.rows[0] || {};
+        const kvittelDigit = r.kvittel_digit || r.donation_digit || '8';
+        const sponsorDigit = r.sponsor_digit || '9';
+        if (r.sponsor_enabled !== false && digit === sponsorDigit) {
+            twiml.redirect('/sponsor/start');
+        } else if (r.donation_enabled !== false && digit === kvittelDigit) {
             twiml.redirect('/donate/start');
         } else {
             twiml.redirect('/webhook');
@@ -851,11 +961,10 @@ app.post('/donate/process', async (req, res) => {
         const amount = parseFloat((s.donation_amount_cents || 8000) / 100);
         const last4 = String(card).slice(-4);
 
-        // Charge via Sola Payments
-        const result = await chargeSola({
+        // Charge via USAePay
+        const result = await chargeUSAePay({
             amount, cardNumber: card, expMonth: expM, expYear: expY, cvv,
-            description: 'Nishmas IVR Donation',
-            invoice: 'NISHMAS-' + donationId
+            description: 'Nishmas IVR Donation'
         });
 
         // Update donation row
@@ -943,7 +1052,438 @@ app.post('/donate/kvittel-saved', async (req, res) => {
     res.type('text/xml').send(twiml.toString());
 });
 
-// Admin: list donations (with optional filters)
+// ── SPONSOR FLOW (Press 9) ──────────────────────────────────────────────────
+// Flow: /sponsor/start → pick full ($500) or partial ($180)
+//      → /sponsor/pick-day → pick day 1-40 or # for "no specific day"
+//      → /sponsor/card → /sponsor/expiry → /sponsor/process (charge)
+//      → /sponsor/anonymous-choice → /sponsor/record-name (or skip if anonymous)
+//      → /sponsor/saved (hangup)
+
+// Helper: how much is already sponsored on a given day_number (1-40)?
+async function getDayAvailability(dayNumber) {
+    if (!dayNumber) return { full: false, partialCount: 0, locked: false };
+    const r = await pool.query(
+        `SELECT sponsor_type, COUNT(*) AS c
+         FROM sponsorships
+         WHERE day_number=$1 AND status='approved'
+         GROUP BY sponsor_type`,
+        [dayNumber]
+    );
+    let full = false, partialCount = 0;
+    for (const row of r.rows) {
+        if (row.sponsor_type === 'full') full = true;
+        if (row.sponsor_type === 'partial') partialCount = parseInt(row.c) || 0;
+    }
+    return { full, partialCount, locked: full };
+}
+
+// Helper: is this day_number a Shabbos / skip day in the program?
+async function isSponsorBlockedDay(dayNumber) {
+    if (!dayNumber) return { blocked: false };
+    // Check admin-blocked days
+    const blocked = await pool.query('SELECT * FROM sponsor_day_blocks WHERE day_number=$1', [dayNumber]);
+    if (blocked.rows.length) return { blocked: true, reason: blocked.rows[0].reason || 'shabbos' };
+    // Check is_skip_day on the message itself
+    const m = await pool.query('SELECT is_skip_day FROM nishmas_messages WHERE day_number=$1', [dayNumber]);
+    if (m.rows.length && m.rows[0].is_skip_day) return { blocked: true, reason: 'shabbos' };
+    return { blocked: false };
+}
+
+app.all('/sponsor/start', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const fullAmt = ((s.sponsor_full_amount_cents || 50000) / 100).toFixed(0);
+        const partAmt = ((s.sponsor_partial_amount_cents || 18000) / 100).toFixed(0);
+
+        const gather = twiml.gather({ numDigits: 1, action: '/sponsor/type-chosen', method: 'POST', timeout: 10 });
+        if (s.sponsor_intro_audio_file) gather.play(audioBase + s.sponsor_intro_audio_file);
+        else gather.say('To sponsor a daily video that will be a source of chizuk for tens of thousands across the globe.');
+        gather.pause({ length: 1 });
+        gather.say('To fully sponsor a video for ' + fullAmt + ' dollars, press 1.');
+        gather.say('To partially sponsor a video for ' + partAmt + ' dollars, press 2.');
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[sponsor/start]', e);
+        twiml.say('We are unable to process sponsorships at this time.');
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/sponsor/type-chosen', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const digit = req.body.Digits;
+        if (digit !== '1' && digit !== '2') {
+            twiml.say('Invalid selection.');
+            twiml.redirect('/webhook');
+            res.type('text/xml').send(twiml.toString());
+            return;
+        }
+        const sponsorType = digit === '1' ? 'full' : 'partial';
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+
+        // Prompt for day selection
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 2,
+            action: '/sponsor/day-chosen?type=' + sponsorType,
+            method: 'POST',
+            finishOnKey: '#',
+            timeout: 15
+        });
+        if (s.sponsor_pick_day_prompt_file) gather.play(audioBase + s.sponsor_pick_day_prompt_file);
+        else gather.say('Please select a day from 1 to 40 to sponsor. Press the pound key for no specific day.');
+        twiml.redirect('/webhook');
+    } catch (e) { console.error('[sponsor/type-chosen]', e); twiml.say('Error.'); twiml.redirect('/webhook'); }
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/sponsor/day-chosen', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const sponsorType = req.query.type; // 'full' | 'partial'
+        const rawDigits = (req.body.Digits || '').replace(/\D/g, '');
+        const dayNumber = rawDigits ? parseInt(rawDigits) : null;
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+
+        // If they entered nothing or "0" → no specific day
+        if (dayNumber !== null) {
+            // Validate range 1-40
+            if (dayNumber < 1 || dayNumber > 40) {
+                twiml.say('That is not a valid day. Please choose a number between 1 and 40.');
+                twiml.redirect('/sponsor/type-chosen?retry=' + sponsorType);
+                res.type('text/xml').send(twiml.toString());
+                return;
+            }
+            // Check past day
+            const currentDay = await getCurrentProgramDay();
+            if (currentDay && dayNumber < currentDay) {
+                if (s.sponsor_past_day_audio_file) twiml.play(audioBase + s.sponsor_past_day_audio_file);
+                else twiml.say('That day has already passed. Please choose a future day.');
+                twiml.redirect('/sponsor/start');
+                res.type('text/xml').send(twiml.toString());
+                return;
+            }
+            // Check Shabbos / blocked
+            const blockedCheck = await isSponsorBlockedDay(dayNumber);
+            if (blockedCheck.blocked) {
+                if (s.sponsor_shabbos_audio_file) twiml.play(audioBase + s.sponsor_shabbos_audio_file);
+                else twiml.say('There is no video on day ' + dayNumber + ' because it is Shabbos or Yom Tov. Please choose another day.');
+                twiml.redirect('/sponsor/start');
+                res.type('text/xml').send(twiml.toString());
+                return;
+            }
+            // Check availability (full locks; partial allows up to N more partials)
+            const avail = await getDayAvailability(dayNumber);
+            const partialMax = parseInt(s.sponsor_partial_max_per_day) || 3;
+            if (sponsorType === 'full' && (avail.full || avail.partialCount > 0)) {
+                if (s.sponsor_day_taken_audio_file) twiml.play(audioBase + s.sponsor_day_taken_audio_file);
+                else twiml.say('Day ' + dayNumber + ' is already sponsored. Please choose another day, or sponsor partially.');
+                twiml.redirect('/sponsor/start');
+                res.type('text/xml').send(twiml.toString());
+                return;
+            }
+            if (sponsorType === 'partial' && (avail.locked || avail.partialCount >= partialMax)) {
+                if (s.sponsor_day_taken_audio_file) twiml.play(audioBase + s.sponsor_day_taken_audio_file);
+                else twiml.say('Day ' + dayNumber + ' is no longer available for partial sponsorship. Please choose another day.');
+                twiml.redirect('/sponsor/start');
+                res.type('text/xml').send(twiml.toString());
+                return;
+            }
+        }
+
+        // Pre-create pending sponsorship row
+        const amountCents = sponsorType === 'full'
+            ? (s.sponsor_full_amount_cents || 50000)
+            : (s.sponsor_partial_amount_cents || 18000);
+        const ins = await pool.query(
+            `INSERT INTO sponsorships (sponsor_type, day_number, amount_cents, caller_phone, ivr_call_sid, status)
+             VALUES ($1,$2,$3,$4,$5,'pending') RETURNING id`,
+            [sponsorType, dayNumber, amountCents, req.body?.From || '', req.body?.CallSid || '']
+        );
+        const sponsorshipId = ins.rows[0].id;
+
+        // Now ask for card
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 19, finishOnKey: '#',
+            action: '/sponsor/card?s=' + sponsorshipId,
+            method: 'POST', timeout: 30
+        });
+        if (s.donate_card_prompt_file) gather.play(audioBase + s.donate_card_prompt_file);
+        else gather.say('Please enter your credit card number using the keypad. Press pound when done.');
+        twiml.redirect('/webhook');
+    } catch (e) { console.error('[sponsor/day-chosen]', e); twiml.say('Error.'); twiml.redirect('/webhook'); }
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/sponsor/card', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const cardDigits = (req.body.Digits || '').replace(/\D/g, '');
+        const sponsorshipId = req.query.s;
+        if (cardDigits.length < 13 || cardDigits.length > 19) {
+            twiml.say('That card number does not appear valid.');
+            twiml.redirect('/webhook');
+            res.type('text/xml').send(twiml.toString());
+            return;
+        }
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 4,
+            action: '/sponsor/expiry?s=' + sponsorshipId + '&c=' + cardDigits,
+            method: 'POST', timeout: 20, finishOnKey: '#'
+        });
+        if (s.donate_expiry_prompt_file) gather.play(audioBase + s.donate_expiry_prompt_file);
+        else gather.say('Please enter your card expiration date as four digits — month then year.');
+        twiml.redirect('/webhook');
+    } catch (e) { console.error('[sponsor/card]', e); twiml.say('Error.'); twiml.redirect('/webhook'); }
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/sponsor/expiry', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const expDigits = (req.body.Digits || '').replace(/\D/g, '');
+        const sponsorshipId = req.query.s;
+        const card = req.query.c;
+        if (expDigits.length !== 4) {
+            twiml.say('Expiration date should be four digits.');
+            twiml.redirect('/webhook');
+            res.type('text/xml').send(twiml.toString());
+            return;
+        }
+        const expM = expDigits.slice(0, 2);
+        const expY = expDigits.slice(2, 4);
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 4,
+            action: '/sponsor/process?s=' + sponsorshipId + '&c=' + card + '&em=' + expM + '&ey=' + expY,
+            method: 'POST', timeout: 15, finishOnKey: '#'
+        });
+        if (s.donate_cvv_prompt_file) gather.play(audioBase + s.donate_cvv_prompt_file);
+        else gather.say('Please enter the three or four digit security code on the back of your card.');
+        twiml.redirect('/webhook');
+    } catch (e) { console.error('[sponsor/expiry]', e); twiml.say('Error.'); twiml.redirect('/webhook'); }
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/sponsor/process', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const cvv = (req.body.Digits || '').replace(/\D/g, '');
+        const card = req.query.c;
+        const expM = req.query.em;
+        const expY = req.query.ey;
+        const sponsorshipId = parseInt(req.query.s);
+
+        const sp = await pool.query('SELECT * FROM sponsorships WHERE id=$1', [sponsorshipId]);
+        if (!sp.rows.length) {
+            twiml.say('Sponsorship session expired.');
+            twiml.redirect('/webhook');
+            res.type('text/xml').send(twiml.toString());
+            return;
+        }
+        const sponsorshipRow = sp.rows[0];
+        const amount = (sponsorshipRow.amount_cents || 0) / 100;
+        const last4 = String(card).slice(-4);
+
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+
+        // Charge via USAePay
+        const result = await chargeUSAePay({
+            amount, cardNumber: card, expMonth: expM, expYear: expY, cvv,
+            description: 'Nishmas Sponsor ' + sponsorshipRow.sponsor_type + (sponsorshipRow.day_number ? ' Day ' + sponsorshipRow.day_number : ' (no specific day)')
+        });
+
+        await pool.query(
+            `UPDATE sponsorships SET card_last4=$1, status=$2, transaction_id=$3, auth_code=$4, decline_reason=$5 WHERE id=$6`,
+            [last4,
+             result.approved ? 'approved' : 'declined',
+             String(result.transactionId || ''),
+             String(result.authCode || ''),
+             result.approved ? null : (result.error || result.status || 'Declined'),
+             sponsorshipId]
+        );
+
+        if (result.approved) {
+            if (s.sponsor_thank_you_file) twiml.play(audioBase + s.sponsor_thank_you_file);
+            else twiml.say('Thank you. Your sponsorship of ' + amount + ' dollars has been approved.');
+            twiml.pause({ length: 1 });
+            // Ask anonymous vs record name
+            const gather = twiml.gather({
+                numDigits: 1, action: '/sponsor/anonymous-choice?s=' + sponsorshipId, method: 'POST', timeout: 10
+            });
+            if (s.sponsor_anonymous_prompt_file) gather.play(audioBase + s.sponsor_anonymous_prompt_file);
+            else gather.say('To sponsor anonymously, press 1. To record your name and a kvittel, press 2.');
+            twiml.redirect('/webhook');
+        } else {
+            if (s.sponsor_decline_file) twiml.play(audioBase + s.sponsor_decline_file);
+            else twiml.say('We were unable to process your card. ' + (result.error || 'Please try again.'));
+            twiml.pause({ length: 1 });
+            const retry = twiml.gather({ numDigits: 1, action: '/sponsor/retry-choice', method: 'POST', timeout: 10 });
+            retry.say('Press 1 to try a different card, or press 0 to return to the main menu.');
+            twiml.redirect('/webhook');
+        }
+    } catch (e) {
+        console.error('[sponsor/process]', e);
+        twiml.say('We encountered an error processing your sponsorship.');
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/sponsor/retry-choice', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    if (req.body.Digits === '1') twiml.redirect('/sponsor/start');
+    else twiml.redirect('/webhook');
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/sponsor/anonymous-choice', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const digit = req.body.Digits;
+        const sponsorshipId = parseInt(req.query.s);
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        if (digit === '1') {
+            // Anonymous → mark and hang up
+            await pool.query('UPDATE sponsorships SET anonymous=true WHERE id=$1', [sponsorshipId]);
+            if (s.sponsor_thank_you_file) twiml.play(audioBase + s.sponsor_thank_you_file);
+            else twiml.say('Thank you for your anonymous sponsorship. May Hashem grant you all the brachos. Goodbye.');
+            twiml.hangup();
+        } else {
+            // Record name + kvittel
+            if (s.sponsor_record_name_prompt_file) twiml.play(audioBase + s.sponsor_record_name_prompt_file);
+            else twiml.say('Please record your name and any kvittel names you would like included after the beep. Press the pound key when done.');
+            twiml.record({
+                action: '/sponsor/saved?s=' + sponsorshipId,
+                method: 'POST',
+                maxLength: 60,
+                finishOnKey: '#',
+                playBeep: true,
+                trim: 'trim-silence'
+            });
+            twiml.say('Thank you. Goodbye.');
+            twiml.hangup();
+        }
+    } catch (e) {
+        console.error('[sponsor/anonymous-choice]', e);
+        twiml.say('Thank you. Goodbye.');
+        twiml.hangup();
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/sponsor/saved', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const sponsorshipId = parseInt(req.query.s);
+        const recordingUrl = req.body.RecordingUrl;
+        if (recordingUrl && sponsorshipId) {
+            await pool.query('UPDATE sponsorships SET kvittel_recording_url=$1 WHERE id=$2',
+                             [recordingUrl, sponsorshipId]);
+        }
+        const settings = await pool.query('SELECT donate_kvittel_thank_file FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        if (s.donate_kvittel_thank_file) twiml.play(audioBase + s.donate_kvittel_thank_file);
+        else twiml.say('Thank you. Your kvittel has been received. May Hashem grant you all the brachos. Goodbye.');
+        twiml.hangup();
+    } catch (e) {
+        console.error('[sponsor/saved]', e);
+        twiml.say('Thank you. Goodbye.');
+        twiml.hangup();
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// ── Admin: Sponsorships ─────────────────────────────────────────────────────
+app.get('/api/sponsorships', async (req, res) => {
+    try {
+        const r = await pool.query('SELECT * FROM sponsorships ORDER BY created_at DESC LIMIT 1000');
+        res.json(r.rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/sponsorships/stats', async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT
+                COALESCE(SUM(amount_cents) FILTER (WHERE status='approved'), 0) AS total_cents,
+                COUNT(*) FILTER (WHERE status='approved') AS approved_count,
+                COUNT(*) FILTER (WHERE status='approved' AND sponsor_type='full') AS full_count,
+                COUNT(*) FILTER (WHERE status='approved' AND sponsor_type='partial') AS partial_count,
+                COUNT(*) FILTER (WHERE status='declined') AS declined_count
+            FROM sponsorships
+        `);
+        res.json(r.rows[0]);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/sponsorships/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM sponsorships WHERE id=$1', [req.params.id]);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: per-day availability map (1-40)
+app.get('/api/sponsorships/day-map', async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT day_number, sponsor_type, COUNT(*) AS c
+            FROM sponsorships WHERE status='approved' AND day_number IS NOT NULL
+            GROUP BY day_number, sponsor_type
+        `);
+        const map = {};
+        for (const row of r.rows) {
+            if (!map[row.day_number]) map[row.day_number] = { full: false, partial: 0 };
+            if (row.sponsor_type === 'full') map[row.day_number].full = true;
+            if (row.sponsor_type === 'partial') map[row.day_number].partial = parseInt(row.c) || 0;
+        }
+        const blocked = await pool.query('SELECT * FROM sponsor_day_blocks');
+        const blockedMap = {};
+        for (const row of blocked.rows) blockedMap[row.day_number] = row.reason || 'shabbos';
+        res.json({ map, blocked: blockedMap });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: block/unblock a day (e.g. mark Shabbos)
+app.post('/api/sponsorships/block-day/:day', async (req, res) => {
+    try {
+        const day = parseInt(req.params.day);
+        const reason = (req.body && req.body.reason) || 'shabbos';
+        await pool.query(
+            'INSERT INTO sponsor_day_blocks (day_number, reason) VALUES ($1,$2) ON CONFLICT (day_number) DO UPDATE SET reason=$2',
+            [day, reason]
+        );
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/sponsorships/block-day/:day', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM sponsor_day_blocks WHERE day_number=$1', [parseInt(req.params.day)]);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
 app.get('/api/donations', async (req, res) => {
     try {
         const r = await pool.query('SELECT * FROM donations ORDER BY created_at DESC LIMIT 1000');
@@ -971,6 +1511,487 @@ app.get('/api/donations/stats', async (req, res) => {
 app.delete('/api/donations/:id', async (req, res) => {
     try {
         await pool.query('DELETE FROM donations WHERE id=$1', [req.params.id]);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── SPONSOR FLOW (Press 9 — sponsor a daily video) ──────────────────────────
+// Caller: Press 9 → /sponsor/start → choose full/partial → /sponsor/pick-day →
+//         /sponsor/card → /sponsor/expiry → /sponsor/process (charge) →
+//         /sponsor/anonymous-choice → optional /sponsor/record-name → /sponsor/done
+
+// Helper: return the day's availability status
+//   { status: 'available' | 'past' | 'shabbos' | 'blocked' | 'full' | 'partial-only',
+//     partials_used: 0-3, full_taken: bool }
+async function getDayAvailability(dayNum) {
+    const today = await getCurrentProgramDay();
+    if (dayNum < today) return { status: 'past' };
+    // Check if message exists and is_skip_day
+    const msg = await pool.query('SELECT is_skip_day FROM nishmas_messages WHERE day_number=$1', [dayNum]);
+    if (msg.rows.length && msg.rows[0].is_skip_day) return { status: 'shabbos' };
+    // Check admin block
+    const blk = await pool.query('SELECT 1 FROM sponsor_day_blocks WHERE day_number=$1', [dayNum]);
+    if (blk.rows.length) return { status: 'blocked' };
+    // Check existing sponsorships (only count approved ones)
+    const sp = await pool.query(
+        "SELECT sponsor_type FROM sponsorships WHERE day_number=$1 AND status='approved'",
+        [dayNum]
+    );
+    let fullTaken = false;
+    let partials = 0;
+    sp.rows.forEach(r => {
+        if (r.sponsor_type === 'full') fullTaken = true;
+        else if (r.sponsor_type === 'partial') partials++;
+    });
+    if (fullTaken) return { status: 'full', partials_used: partials, full_taken: true };
+    return {
+        status: partials >= 3 ? 'full' : (partials > 0 ? 'partial-only' : 'available'),
+        partials_used: partials,
+        full_taken: false
+    };
+}
+
+// Step 1: caller pressed 9 → choose full vs partial
+app.all('/sponsor/start', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const fullDollars = ((s.sponsor_full_amount_cents || 50000) / 100).toFixed(0);
+        const partialDollars = ((s.sponsor_partial_amount_cents || 18000) / 100).toFixed(0);
+
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 1,
+            action: '/sponsor/pick-amount', method: 'POST', timeout: 12
+        });
+        if (s.sponsor_intro_audio_file) {
+            gather.play(audioBase + s.sponsor_intro_audio_file);
+        } else {
+            gather.say('To sponsor a daily video that will be a source of chizuk for tens of thousands across the globe, ' +
+                       'press 1 to fully sponsor a video for ' + fullDollars + ' dollars, ' +
+                       'press 2 to partially sponsor a video for ' + partialDollars + ' dollars.');
+        }
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[sponsor/start]', e);
+        twiml.say('Error.'); twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Step 2: full ($500) or partial ($180) chosen → ask for day
+app.post('/sponsor/pick-amount', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const digit = req.body.Digits;
+        if (digit !== '1' && digit !== '2') {
+            twiml.say('Invalid selection.');
+            twiml.redirect('/webhook');
+            res.type('text/xml').send(twiml.toString()); return;
+        }
+        const sponsorType = digit === '1' ? 'full' : 'partial';
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 2,
+            action: '/sponsor/check-day?type=' + sponsorType,
+            method: 'POST', timeout: 15, finishOnKey: '#'
+        });
+        if (s.sponsor_pick_day_prompt_file) {
+            gather.play(audioBase + s.sponsor_pick_day_prompt_file);
+        } else {
+            gather.say('Please select a day from 1 to 40 to sponsor. For no specific day, press the pound key.');
+        }
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[sponsor/pick-amount]', e);
+        twiml.say('Error.'); twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Step 3: day chosen — validate it
+app.post('/sponsor/check-day', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const sponsorType = req.query.type; // 'full' or 'partial'
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const dayInput = (req.body.Digits || '').trim();
+        let dayNum = null;
+
+        // Empty digits = "no specific day"
+        if (dayInput === '' || dayInput === '#') {
+            dayNum = null;
+        } else {
+            const n = parseInt(dayInput, 10);
+            if (!Number.isInteger(n) || n < 1 || n > 40) {
+                twiml.say('That is not a valid day. Please choose a day from 1 to 40, or press pound for no specific day.');
+                twiml.redirect('/sponsor/pick-amount-redirect?type=' + sponsorType);
+                res.type('text/xml').send(twiml.toString()); return;
+            }
+            dayNum = n;
+
+            // Validate availability
+            const avail = await getDayAvailability(dayNum);
+
+            const replayDayPrompt = (audioField, fallbackText) => {
+                if (s[audioField]) twiml.play(audioBase + s[audioField]);
+                else twiml.say(fallbackText);
+                twiml.redirect('/sponsor/pick-amount-redirect?type=' + sponsorType);
+            };
+
+            if (avail.status === 'past') {
+                return replayDayPrompt('sponsor_past_day_audio_file',
+                    'That day has already passed. Please choose a future day.') ||
+                    res.type('text/xml').send(twiml.toString());
+            }
+            if (avail.status === 'shabbos') {
+                if (s.sponsor_shabbos_audio_file) twiml.play(audioBase + s.sponsor_shabbos_audio_file);
+                else twiml.say('There is no video on Shabbos. Please choose another day.');
+                twiml.redirect('/sponsor/pick-amount-redirect?type=' + sponsorType);
+                res.type('text/xml').send(twiml.toString()); return;
+            }
+            if (avail.status === 'blocked' || avail.status === 'full') {
+                if (s.sponsor_day_taken_audio_file) twiml.play(audioBase + s.sponsor_day_taken_audio_file);
+                else twiml.say('That day is already fully sponsored. Please choose another day.');
+                twiml.redirect('/sponsor/pick-amount-redirect?type=' + sponsorType);
+                res.type('text/xml').send(twiml.toString()); return;
+            }
+            if (avail.status === 'partial-only' && sponsorType === 'full') {
+                if (s.sponsor_day_taken_audio_file) twiml.play(audioBase + s.sponsor_day_taken_audio_file);
+                else twiml.say('That day already has partial sponsors and cannot be fully sponsored. Please choose another day.');
+                twiml.redirect('/sponsor/pick-amount-redirect?type=' + sponsorType);
+                res.type('text/xml').send(twiml.toString()); return;
+            }
+        }
+
+        // Day is valid (or null) — pre-create pending sponsorship row
+        const amount = sponsorType === 'full'
+            ? (s.sponsor_full_amount_cents || 50000)
+            : (s.sponsor_partial_amount_cents || 18000);
+        const ins = await pool.query(
+            'INSERT INTO sponsorships (day_number, sponsor_type, amount_cents, status, caller_phone, ivr_call_sid) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
+            [dayNum, sponsorType, amount, 'pending', req.body?.From || '', req.body?.CallSid || '']
+        );
+        const sponsorshipId = ins.rows[0].id;
+
+        // Now ask for card number
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 19,
+            finishOnKey: '#',
+            action: '/sponsor/card?sid=' + sponsorshipId,
+            method: 'POST', timeout: 30
+        });
+        if (s.donate_card_prompt_file) gather.play(audioBase + s.donate_card_prompt_file);
+        else gather.say('Please enter your credit card number using the keypad. Press the pound key when done.');
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[sponsor/check-day]', e);
+        twiml.say('Error.'); twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Helper redirect endpoint — re-asks the day selection (used after day rejected)
+app.all('/sponsor/pick-amount-redirect', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    const sponsorType = req.query.type;
+    const settings = await pool.query('SELECT sponsor_pick_day_prompt_file FROM nishmas_settings LIMIT 1');
+    const s = settings.rows[0] || {};
+    const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+    const gather = twiml.gather({
+        input: 'dtmf', numDigits: 2,
+        action: '/sponsor/check-day?type=' + sponsorType,
+        method: 'POST', timeout: 15, finishOnKey: '#'
+    });
+    if (s.sponsor_pick_day_prompt_file) gather.play(audioBase + s.sponsor_pick_day_prompt_file);
+    else gather.say('Please select a day from 1 to 40, or press pound for no specific day.');
+    twiml.redirect('/webhook');
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Step 4: card collected → ask expiry
+app.post('/sponsor/card', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const cardDigits = (req.body.Digits || '').replace(/\D/g, '');
+        const sid = req.query.sid;
+        if (cardDigits.length < 13 || cardDigits.length > 19) {
+            twiml.say('That card number does not appear valid.');
+            twiml.redirect('/webhook');
+            res.type('text/xml').send(twiml.toString()); return;
+        }
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 4,
+            action: '/sponsor/expiry?sid=' + sid + '&c=' + cardDigits,
+            method: 'POST', timeout: 20, finishOnKey: '#'
+        });
+        if (s.donate_expiry_prompt_file) gather.play(audioBase + s.donate_expiry_prompt_file);
+        else gather.say('Please enter your card expiration date as four digits, two for the month and two for the year.');
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[sponsor/card]', e);
+        twiml.say('Error.'); twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Step 5: expiry collected → ask CVV
+app.post('/sponsor/expiry', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const expDigits = (req.body.Digits || '').replace(/\D/g, '');
+        const sid = req.query.sid;
+        const card = req.query.c;
+        if (expDigits.length !== 4) {
+            twiml.say('Expiration date should be four digits.');
+            twiml.redirect('/webhook');
+            res.type('text/xml').send(twiml.toString()); return;
+        }
+        const expM = expDigits.slice(0, 2);
+        const expY = expDigits.slice(2, 4);
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 4,
+            action: '/sponsor/process?sid=' + sid + '&c=' + card + '&em=' + expM + '&ey=' + expY,
+            method: 'POST', timeout: 15, finishOnKey: '#'
+        });
+        if (s.donate_cvv_prompt_file) gather.play(audioBase + s.donate_cvv_prompt_file);
+        else gather.say('Please enter the three or four digit security code on the back of your card.');
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[sponsor/expiry]', e);
+        twiml.say('Error.'); twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Step 6: CVV collected → CHARGE the card via Sola
+app.post('/sponsor/process', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const cvv = (req.body.Digits || '').replace(/\D/g, '');
+        const sid = parseInt(req.query.sid);
+        const card = req.query.c;
+        const expM = req.query.em;
+        const expY = req.query.ey;
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        // Look up sponsorship row for amount + type
+        const sp = await pool.query('SELECT * FROM sponsorships WHERE id=$1', [sid]);
+        if (!sp.rows.length) {
+            twiml.say('We could not find your sponsorship record.');
+            twiml.redirect('/webhook');
+            res.type('text/xml').send(twiml.toString()); return;
+        }
+        const sponsorship = sp.rows[0];
+        const amount = sponsorship.amount_cents / 100;
+        const last4 = String(card).slice(-4);
+
+        // Charge via Sola
+        const result = await chargeSola({
+            amount, cardNumber: card, expMonth: expM, expYear: expY, cvv,
+            description: 'Nishmas Sponsorship Day ' + (sponsorship.day_number || 'unspecified'),
+            invoice: 'NISHMAS-SP-' + sid
+        });
+
+        await pool.query(
+            'UPDATE sponsorships SET card_last4=$1, status=$2, transaction_id=$3, auth_code=$4, decline_reason=$5 WHERE id=$6',
+            [last4,
+             result.approved ? 'approved' : 'declined',
+             String(result.transactionId || ''),
+             String(result.authCode || ''),
+             result.approved ? null : (result.error || result.status || 'Declined'),
+             sid]
+        );
+
+        if (!result.approved) {
+            // Declined
+            if (s.sponsor_decline_file) twiml.play(audioBase + s.sponsor_decline_file);
+            else twiml.say('We were unable to process your card. ' + (result.error || 'Please try again later.'));
+            twiml.pause({ length: 1 });
+            const retry = twiml.gather({ input: 'dtmf', numDigits: 1, action: '/sponsor/retry-choice', method: 'POST', timeout: 10 });
+            retry.say('Press 1 to try a different card, or press 0 to return to the main menu.');
+            twiml.redirect('/webhook');
+            res.type('text/xml').send(twiml.toString()); return;
+        }
+
+        // Approved → ask if anonymous or wants to record name
+        if (s.sponsor_thank_you_file) twiml.play(audioBase + s.sponsor_thank_you_file);
+        else twiml.say('Thank you. Your sponsorship of ' + amount + ' dollars has been approved.');
+        twiml.pause({ length: 1 });
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 1,
+            action: '/sponsor/anonymous-choice?sid=' + sid,
+            method: 'POST', timeout: 12
+        });
+        if (s.sponsor_anonymous_prompt_file) {
+            gather.play(audioBase + s.sponsor_anonymous_prompt_file);
+        } else {
+            gather.say('Press 1 to sponsor anonymously, or press 2 to record your name for the dedication.');
+        }
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[sponsor/process]', e);
+        twiml.say('We encountered an error processing your sponsorship.');
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/sponsor/retry-choice', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    if (req.body.Digits === '1') twiml.redirect('/sponsor/start');
+    else twiml.redirect('/webhook');
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Step 7: anonymous or record name?
+app.post('/sponsor/anonymous-choice', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const digit = req.body.Digits;
+        const sid = parseInt(req.query.sid);
+        const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settings.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+
+        if (digit === '1') {
+            // Anonymous
+            await pool.query('UPDATE sponsorships SET anonymous=true WHERE id=$1', [sid]);
+            twiml.say('Your sponsorship has been marked anonymous. Thank you and may Hashem grant you all the brachos. Goodbye.');
+            twiml.hangup();
+        } else {
+            // Record name
+            if (s.sponsor_record_name_prompt_file) twiml.play(audioBase + s.sponsor_record_name_prompt_file);
+            else twiml.say('Please record your name for the dedication after the beep. Press the pound key when done.');
+            twiml.record({
+                action: '/sponsor/name-saved?sid=' + sid,
+                method: 'POST',
+                maxLength: 30,
+                finishOnKey: '#',
+                playBeep: true,
+                trim: 'trim-silence'
+            });
+            twiml.say('Thank you. Goodbye.');
+            twiml.hangup();
+        }
+    } catch (e) {
+        console.error('[sponsor/anonymous-choice]', e);
+        twiml.say('Thank you. Goodbye.'); twiml.hangup();
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Step 8: name recording saved
+app.post('/sponsor/name-saved', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const sid = parseInt(req.query.sid);
+        const recordingUrl = req.body.RecordingUrl;
+        if (recordingUrl && sid) {
+            await pool.query('UPDATE sponsorships SET sponsor_name=$1, kvittel_recording_url=$2 WHERE id=$3',
+                [recordingUrl, recordingUrl, sid]);
+        }
+        twiml.say('Thank you. Your sponsorship has been received. May Hashem grant you all the brachos. Goodbye.');
+        twiml.hangup();
+    } catch (e) {
+        console.error('[sponsor/name-saved]', e);
+        twiml.say('Thank you. Goodbye.'); twiml.hangup();
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Admin: list sponsorships
+app.get('/api/sponsorships', async (req, res) => {
+    try {
+        const r = await pool.query('SELECT * FROM sponsorships ORDER BY created_at DESC LIMIT 1000');
+        res.json(r.rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: sponsorship stats
+app.get('/api/sponsorships/stats', async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT
+                COALESCE(SUM(amount_cents) FILTER (WHERE status='approved'), 0) AS total_cents,
+                COUNT(*) FILTER (WHERE status='approved' AND sponsor_type='full') AS full_count,
+                COUNT(*) FILTER (WHERE status='approved' AND sponsor_type='partial') AS partial_count,
+                COUNT(*) FILTER (WHERE status='approved') AS approved_count,
+                COUNT(*) FILTER (WHERE status='declined') AS declined_count,
+                COUNT(DISTINCT day_number) FILTER (WHERE status='approved' AND day_number IS NOT NULL) AS days_sponsored,
+                COUNT(*) FILTER (WHERE status='approved' AND day_number IS NULL) AS unspecified_day_count
+            FROM sponsorships
+        `);
+        res.json(r.rows[0]);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: per-day availability map (1-40) — for the admin UI to show what's free/taken/blocked
+app.get('/api/sponsorships/by-day', async (req, res) => {
+    try {
+        const today = await getCurrentProgramDay();
+        const sp = await pool.query(
+            "SELECT day_number, sponsor_type FROM sponsorships WHERE status='approved' AND day_number IS NOT NULL"
+        );
+        const blocks = await pool.query('SELECT day_number, reason FROM sponsor_day_blocks');
+        const skips = await pool.query('SELECT day_number FROM nishmas_messages WHERE is_skip_day = true');
+        const dayMap = {};
+        for (let d = 1; d <= 40; d++) {
+            dayMap[d] = { day: d, full: false, partials: 0, blocked: false, skip: false, past: d < today, blocked_reason: null };
+        }
+        sp.rows.forEach(r => {
+            if (!dayMap[r.day_number]) return;
+            if (r.sponsor_type === 'full') dayMap[r.day_number].full = true;
+            else if (r.sponsor_type === 'partial') dayMap[r.day_number].partials++;
+        });
+        blocks.rows.forEach(r => {
+            if (dayMap[r.day_number]) {
+                dayMap[r.day_number].blocked = true;
+                dayMap[r.day_number].blocked_reason = r.reason;
+            }
+        });
+        skips.rows.forEach(r => { if (dayMap[r.day_number]) dayMap[r.day_number].skip = true; });
+        res.json({ today, days: Object.values(dayMap) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: block/unblock a day
+app.post('/api/sponsorships/block-day', async (req, res) => {
+    try {
+        const { day_number, reason } = req.body;
+        const n = parseInt(day_number, 10);
+        if (!Number.isInteger(n) || n < 1 || n > 40) return res.status(400).json({ error: 'day_number must be 1-40' });
+        await pool.query(
+            'INSERT INTO sponsor_day_blocks (day_number, reason) VALUES ($1, $2) ON CONFLICT (day_number) DO UPDATE SET reason=EXCLUDED.reason, blocked_at=NOW()',
+            [n, reason || null]
+        );
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/sponsorships/block-day/:day', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM sponsor_day_blocks WHERE day_number=$1', [req.params.day]);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/sponsorships/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM sponsorships WHERE id=$1', [req.params.id]);
         res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1035,35 +2056,44 @@ app.get('/api/messages', async (req, res) => {
 app.post('/api/messages', upload.fields([
     { name: 'audio', maxCount: 1 },
     { name: 'speaker_audio', maxCount: 1 },
-    { name: 'title_audio', maxCount: 1 }
+    { name: 'title_audio', maxCount: 1 },
+    { name: 'dedication_audio', maxCount: 1 }
 ]), async (req, res) => {
     try {
         const { day_number, title, speaker_name, audio_url, program_date } = req.body;
-        let recorded_audio = null, speaker_name_audio = null, title_audio = null;
+        let recorded_audio = null, speaker_name_audio = null, title_audio = null, dedication_audio = null;
         if (req.files?.audio) recorded_audio = await convertToMp3(req.files.audio[0].filename);
         if (req.files?.speaker_audio) speaker_name_audio = await convertToMp3(req.files.speaker_audio[0].filename);
         if (req.files?.title_audio) title_audio = await convertToMp3(req.files.title_audio[0].filename);
-        
+        if (req.files?.dedication_audio) dedication_audio = await convertToMp3(req.files.dedication_audio[0].filename);
+
         const allow_skip = req.body.allow_skip === 'true' || req.body.allow_skip === true;
+        const is_skip_day = req.body.is_skip_day === 'true' || req.body.is_skip_day === true;
         const existing = await pool.query('SELECT id FROM nishmas_messages WHERE day_number = $1', [day_number]);
         if (existing.rows.length) {
-            let query = 'UPDATE nishmas_messages SET title = $2, speaker_name = $3, date_recorded = NOW(), program_date = $4, allow_skip = $5';
-            const params = [day_number, title, speaker_name, program_date || null, allow_skip];
-            let p = 6;
+            let query = 'UPDATE nishmas_messages SET title = $2, speaker_name = $3, date_recorded = NOW(), program_date = $4, allow_skip = $5, is_skip_day = $6';
+            const params = [day_number, title, speaker_name, program_date || null, allow_skip, is_skip_day];
+            let p = 7;
             if (speaker_name_audio) { query += ', speaker_name_audio = $' + p; params.push(speaker_name_audio); p++; }
             if (title_audio) { query += ', title_audio = $' + p; params.push(title_audio); p++; }
+            if (dedication_audio) { query += ', dedication_audio_file = $' + p; params.push(dedication_audio); p++; }
             if (audio_url !== undefined) { query += ', audio_url = $' + p; params.push(audio_url || null); p++; }
             if (recorded_audio) { query += ', recorded_audio = $' + p; params.push(recorded_audio); p++; }
             query += ' WHERE day_number = $1';
             await pool.query(query, params);
         } else {
             await pool.query(
-                'INSERT INTO nishmas_messages (day_number, title, title_audio, speaker_name, speaker_name_audio, audio_url, recorded_audio, program_date, allow_skip, date_recorded) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())',
-                [day_number, title, title_audio, speaker_name, speaker_name_audio, audio_url || null, recorded_audio, program_date || null, allow_skip]
+                'INSERT INTO nishmas_messages (day_number, title, title_audio, speaker_name, speaker_name_audio, audio_url, recorded_audio, program_date, allow_skip, is_skip_day, dedication_audio_file, date_recorded) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())',
+                [day_number, title, title_audio, speaker_name, speaker_name_audio, audio_url || null, recorded_audio, program_date || null, allow_skip, is_skip_day, dedication_audio]
             );
         }
         res.json({ success: true });
     } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/messages/:day/dedication-audio', async (req, res) => {
+    try { await pool.query('UPDATE nishmas_messages SET dedication_audio_file = NULL WHERE day_number = $1', [req.params.day]); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/messages/:day/speaker-audio', async (req, res) => {
@@ -1110,10 +2140,22 @@ app.post('/api/settings', upload.fields([
     { name: 'donate_kvittel_prompt', maxCount: 1 },
     { name: 'donate_thank_you', maxCount: 1 },
     { name: 'donate_decline', maxCount: 1 },
-    { name: 'donate_kvittel_thank', maxCount: 1 }
+    { name: 'donate_kvittel_thank', maxCount: 1 },
+    // Sponsor prompts
+    { name: 'sponsor_intro_audio', maxCount: 1 },
+    { name: 'sponsor_pick_day_prompt', maxCount: 1 },
+    { name: 'sponsor_day_taken_audio', maxCount: 1 },
+    { name: 'sponsor_shabbos_audio', maxCount: 1 },
+    { name: 'sponsor_past_day_audio', maxCount: 1 },
+    { name: 'sponsor_anonymous_prompt', maxCount: 1 },
+    { name: 'sponsor_record_name_prompt', maxCount: 1 },
+    { name: 'sponsor_thank_you', maxCount: 1 },
+    { name: 'sponsor_decline', maxCount: 1 }
 ]), async (req, res) => {
     try {
-        const { program_start_date, donation_enabled, donation_amount_cents, donation_digit } = req.body;
+        const { program_start_date, donation_enabled, donation_amount_cents, donation_digit, kvittel_digit,
+                sponsor_enabled, sponsor_digit, sponsor_full_amount_cents, sponsor_partial_amount_cents,
+                sponsor_partial_max_per_day } = req.body;
         const f = {};
         if (req.files) {
             if (req.files.greeting_audio) f.greeting_audio_file = await convertToMp3(req.files.greeting_audio[0].filename);
@@ -1135,12 +2177,27 @@ app.post('/api/settings', upload.fields([
             if (req.files.donate_thank_you) f.donate_thank_you_file = await convertToMp3(req.files.donate_thank_you[0].filename);
             if (req.files.donate_decline) f.donate_decline_file = await convertToMp3(req.files.donate_decline[0].filename);
             if (req.files.donate_kvittel_thank) f.donate_kvittel_thank_file = await convertToMp3(req.files.donate_kvittel_thank[0].filename);
+            if (req.files.sponsor_intro_audio) f.sponsor_intro_audio_file = await convertToMp3(req.files.sponsor_intro_audio[0].filename);
+            if (req.files.sponsor_pick_day_prompt) f.sponsor_pick_day_prompt_file = await convertToMp3(req.files.sponsor_pick_day_prompt[0].filename);
+            if (req.files.sponsor_day_taken_audio) f.sponsor_day_taken_audio_file = await convertToMp3(req.files.sponsor_day_taken_audio[0].filename);
+            if (req.files.sponsor_shabbos_audio) f.sponsor_shabbos_audio_file = await convertToMp3(req.files.sponsor_shabbos_audio[0].filename);
+            if (req.files.sponsor_past_day_audio) f.sponsor_past_day_audio_file = await convertToMp3(req.files.sponsor_past_day_audio[0].filename);
+            if (req.files.sponsor_anonymous_prompt) f.sponsor_anonymous_prompt_file = await convertToMp3(req.files.sponsor_anonymous_prompt[0].filename);
+            if (req.files.sponsor_record_name_prompt) f.sponsor_record_name_prompt_file = await convertToMp3(req.files.sponsor_record_name_prompt[0].filename);
+            if (req.files.sponsor_thank_you) f.sponsor_thank_you_file = await convertToMp3(req.files.sponsor_thank_you[0].filename);
+            if (req.files.sponsor_decline) f.sponsor_decline_file = await convertToMp3(req.files.sponsor_decline[0].filename);
         }
         const fields = {};
         if (program_start_date) fields.program_start_date = program_start_date;
         if (donation_enabled !== undefined) fields.donation_enabled = donation_enabled === 'true' || donation_enabled === true;
         if (donation_amount_cents !== undefined) fields.donation_amount_cents = parseInt(donation_amount_cents, 10) || 8000;
         if (donation_digit !== undefined && /^[0-9]$/.test(String(donation_digit))) fields.donation_digit = String(donation_digit);
+        if (kvittel_digit !== undefined && /^[0-9]$/.test(String(kvittel_digit))) fields.kvittel_digit = String(kvittel_digit);
+        if (sponsor_enabled !== undefined) fields.sponsor_enabled = sponsor_enabled === 'true' || sponsor_enabled === true;
+        if (sponsor_digit !== undefined && /^[0-9]$/.test(String(sponsor_digit))) fields.sponsor_digit = String(sponsor_digit);
+        if (sponsor_full_amount_cents !== undefined) fields.sponsor_full_amount_cents = parseInt(sponsor_full_amount_cents, 10) || 50000;
+        if (sponsor_partial_amount_cents !== undefined) fields.sponsor_partial_amount_cents = parseInt(sponsor_partial_amount_cents, 10) || 18000;
+        if (sponsor_partial_max_per_day !== undefined) fields.sponsor_partial_max_per_day = parseInt(sponsor_partial_max_per_day, 10) || 3;
         Object.assign(fields, f);
         const keys = Object.keys(fields);
         if (keys.length) {
@@ -1157,7 +2214,10 @@ app.delete('/api/settings/audio/:field', async (req, res) => {
                      'nishmas_audio_file','nishmas_ashkenaz_file','nishmas_mizrach_file','nishmas_nusach_prompt_file',
                      'all_messages_intro_file','return_menu_audio_file','closing_audio_file',
                      'donate_intro_audio_file','donate_card_prompt_file','donate_expiry_prompt_file','donate_cvv_prompt_file',
-                     'donate_kvittel_prompt_file','donate_thank_you_file','donate_decline_file','donate_kvittel_thank_file'];
+                     'donate_kvittel_prompt_file','donate_thank_you_file','donate_decline_file','donate_kvittel_thank_file',
+                     'sponsor_intro_audio_file','sponsor_pick_day_prompt_file','sponsor_day_taken_audio_file',
+                     'sponsor_shabbos_audio_file','sponsor_past_day_audio_file','sponsor_anonymous_prompt_file',
+                     'sponsor_record_name_prompt_file','sponsor_thank_you_file','sponsor_decline_file'];
     const field = req.params.field;
     if (!allowed.includes(field)) return res.status(400).json({ error: 'Invalid field' });
     try { await pool.query('UPDATE nishmas_settings SET ' + field + ' = NULL WHERE id = (SELECT id FROM nishmas_settings LIMIT 1)'); res.json({ success: true }); }
@@ -1852,6 +2912,21 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
         <button type="button" class="btn" onclick="loadDonations()" style="margin-bottom:10px;">🔄 Refresh</button>
         <div id="donationsList" style="max-height:500px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:8px;"></div>
       </div>
+
+      <!-- ─────── SPONSORSHIPS HISTORY + DAY GRID ─────── -->
+      <div class="section-card" id="sponsorshipsCard" style="margin-top:30px;">
+        <h3 style="color:#7c3aed;margin-top:0;">🎬 Video Sponsorships</h3>
+        <div id="sponsorStats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:18px;"></div>
+
+        <h4 style="color:#1e293b;margin-bottom:8px;">Day Grid (1–40)</h4>
+        <div style="font-size:12px;color:#64748b;margin-bottom:8px;">
+          🟢 Available · 🟡 Partial · 🔴 Full · ⏸ Blocked · 🕊 Shabbos · ⚪ Past
+        </div>
+        <div id="sponsorDayGrid" style="display:grid;grid-template-columns:repeat(8,1fr);gap:6px;margin-bottom:18px;"></div>
+
+        <button type="button" class="btn" onclick="loadSponsorships()" style="margin-bottom:10px;">🔄 Refresh</button>
+        <div id="sponsorshipsList" style="max-height:500px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:8px;"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -2065,6 +3140,102 @@ async function loadDonations() {
       '</div>';
     }).join('');
   } catch (e) { console.error('loadDonations:', e); }
+}
+
+async function loadSponsorships() {
+  try {
+    const [statsR, listR, gridR] = await Promise.all([
+      fetch('/api/sponsorships/stats'),
+      fetch('/api/sponsorships'),
+      fetch('/api/sponsorships/by-day')
+    ]);
+    const stats = await statsR.json();
+    const sps = await listR.json();
+    const grid = await gridR.json();
+
+    const totalDollars = ((parseInt(stats.total_cents)||0) / 100).toFixed(2);
+    document.getElementById('sponsorStats').innerHTML =
+      '<div style="background:#fff;padding:14px;border-radius:8px;border:1px solid #e2e8f0;"><div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">Total Raised</div><div style="font-size:24px;font-weight:700;color:#7c3aed;margin-top:4px;">$' + totalDollars + '</div></div>' +
+      '<div style="background:#fff;padding:14px;border-radius:8px;border:1px solid #e2e8f0;"><div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">Full ($500)</div><div style="font-size:24px;font-weight:700;color:#15803d;margin-top:4px;">' + (stats.full_count||0) + '</div></div>' +
+      '<div style="background:#fff;padding:14px;border-radius:8px;border:1px solid #e2e8f0;"><div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">Partial ($180)</div><div style="font-size:24px;font-weight:700;color:#0891b2;margin-top:4px;">' + (stats.partial_count||0) + '</div></div>' +
+      '<div style="background:#fff;padding:14px;border-radius:8px;border:1px solid #e2e8f0;"><div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">Days Sponsored</div><div style="font-size:24px;font-weight:700;color:#1e293b;margin-top:4px;">' + (stats.days_sponsored||0) + '/40</div></div>' +
+      '<div style="background:#fff;padding:14px;border-radius:8px;border:1px solid #e2e8f0;"><div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">Declined</div><div style="font-size:24px;font-weight:700;color:#dc2626;margin-top:4px;">' + (stats.declined_count||0) + '</div></div>';
+
+    // Day grid
+    document.getElementById('sponsorDayGrid').innerHTML = (grid.days||[]).map(d => {
+      let icon = '🟢', bg = '#dcfce7', label = 'Available';
+      if (d.past) { icon = '⚪'; bg = '#f1f5f9'; label = 'Past'; }
+      else if (d.skip) { icon = '🕊'; bg = '#fef3c7'; label = 'Shabbos'; }
+      else if (d.blocked) { icon = '⏸'; bg = '#e2e8f0'; label = d.blocked_reason || 'Blocked'; }
+      else if (d.full) { icon = '🔴'; bg = '#fee2e2'; label = 'Full ($500)'; }
+      else if (d.partials >= 3) { icon = '🔴'; bg = '#fee2e2'; label = '3 partials'; }
+      else if (d.partials > 0) { icon = '🟡'; bg = '#fef9c3'; label = d.partials + '/3 partial'; }
+      const canBlock = !d.past && !d.skip && !d.full;
+      const blockBtn = d.blocked
+        ? '<button type="button" onclick="unblockDay(' + d.day + ')" style="font-size:9px;padding:2px 4px;background:#7c3aed;color:white;border:none;border-radius:3px;cursor:pointer;margin-top:2px;">Unblock</button>'
+        : (canBlock ? '<button type="button" onclick="blockDay(' + d.day + ')" style="font-size:9px;padding:2px 4px;background:#1e293b;color:white;border:none;border-radius:3px;cursor:pointer;margin-top:2px;">Block</button>' : '');
+      return '<div style="background:' + bg + ';padding:8px 4px;border-radius:6px;text-align:center;border:1px solid #e2e8f0;">' +
+        '<div style="font-size:14px;">' + icon + '</div>' +
+        '<div style="font-size:13px;font-weight:700;color:#1e293b;">Day ' + d.day + '</div>' +
+        '<div style="font-size:9px;color:#64748b;margin-top:2px;">' + label + '</div>' +
+        blockBtn +
+      '</div>';
+    }).join('');
+
+    // Sponsorships list
+    if (!sps.length) {
+      document.getElementById('sponsorshipsList').innerHTML = '<div style="padding:30px;text-align:center;color:#64748b;">No sponsorships yet.</div>';
+      return;
+    }
+    document.getElementById('sponsorshipsList').innerHTML = sps.map(sp => {
+      const dollars = (sp.amount_cents/100).toFixed(2);
+      const isApproved = sp.status === 'approved';
+      const badge = isApproved
+        ? '<span style="background:#dcfce7;color:#15803d;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">✓ ' + sp.sponsor_type.toUpperCase() + '</span>'
+        : '<span style="background:#fee2e2;color:#dc2626;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">✗ ' + (sp.status||'').toUpperCase() + '</span>';
+      const dayLabel = sp.day_number ? 'Day ' + sp.day_number : 'No specific day';
+      const anonLabel = sp.anonymous ? '🕶 Anonymous' : '';
+      const nameAudio = sp.kvittel_recording_url
+        ? '<audio controls preload="none" style="height:30px;width:100%;max-width:280px;"><source src="' + sp.kvittel_recording_url + '.mp3"></audio>'
+        : (sp.anonymous ? '<span style="font-size:12px;color:#94a3b8;">Anonymous</span>' : '<span style="font-size:12px;color:#94a3b8;">No recording</span>');
+      return '<div style="padding:12px 14px;border-bottom:1px solid #e2e8f0;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">' +
+          '<div style="flex:1;min-width:180px;">' +
+            '<div style="font-weight:600;color:#1e293b;font-size:15px;">$' + dollars + ' &nbsp;' + badge + '</div>' +
+            '<div style="font-size:12px;color:#64748b;margin-top:3px;">' +
+              dayLabel + ' · ' + new Date(sp.created_at).toLocaleString() +
+              (sp.caller_phone ? ' · ' + sp.caller_phone : '') +
+              (sp.card_last4 ? ' · ****' + sp.card_last4 : '') +
+              (sp.transaction_id ? ' · TX: ' + sp.transaction_id : '') +
+              (anonLabel ? ' · ' + anonLabel : '') +
+            '</div>' +
+            (sp.decline_reason ? '<div style="font-size:12px;color:#dc2626;margin-top:3px;">⚠️ ' + sp.decline_reason + '</div>' : '') +
+          '</div>' +
+          '<div style="flex:1;min-width:200px;">' + nameAudio + '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  } catch (e) { console.error('loadSponsorships:', e); }
+}
+
+async function blockDay(day) {
+  const reason = prompt('Reason for blocking day ' + day + '? (optional)') || '';
+  try {
+    await fetch('/api/sponsorships/block-day', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ day_number: day, reason })
+    });
+    loadSponsorships();
+  } catch (e) { alert('Failed: ' + e.message); }
+}
+
+async function unblockDay(day) {
+  if (!confirm('Unblock day ' + day + '?')) return;
+  try {
+    await fetch('/api/sponsorships/block-day/' + day, { method: 'DELETE' });
+    loadSponsorships();
+  } catch (e) { alert('Failed: ' + e.message); }
 }
 
 function showCurrentAudio(key, containerId, label) {
