@@ -5,8 +5,84 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
+const https = require('https');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+
+// ── USAePay credentials ─────────────────────────────────────────────────────
+const USAEPAY_SOURCE_KEY = process.env.USAEPAY_SOURCE_KEY || 'X1YgGedt7JxvZ5JDjjWPV9MKL9Ihx268';
+const USAEPAY_PIN        = process.env.USAEPAY_PIN        || '4321';
+const USAEPAY_HOST       = process.env.USAEPAY_HOST       || 'usaepay.com'; // production host
+const DONATION_AMOUNT    = parseFloat(process.env.DONATION_AMOUNT || '40');  // $40 default
+
+// Charge a card via USAePay v2 REST. Returns { ok, approved, transactionId, error }
+async function chargeUSAePay({ amount, cardNumber, expMonth, expYear, cvv, description }) {
+  return new Promise((resolve) => {
+    // USAePay v2 REST API uses bearer token auth. Build the auth header per docs:
+    // PIN-style auth is built using "src_key:hash:seed" where hash is SHA256 of (src_key + seed + pin)
+    const crypto = require('crypto');
+    const seed = Math.random().toString(36).slice(2, 12);
+    const hashInput = USAEPAY_SOURCE_KEY + seed + USAEPAY_PIN;
+    const hashStr = crypto.createHash('sha256').update(hashInput).digest('hex');
+    const authStr = USAEPAY_SOURCE_KEY + ':' + hashStr + ':' + seed;
+
+    const expMo2 = String(expMonth).padStart(2, '0').slice(-2);
+    const expYr2 = String(expYear).length >= 4 ? String(expYear).slice(-2) : String(expYear).padStart(2, '0').slice(-2);
+
+    const body = JSON.stringify({
+      command: 'cc:sale',
+      amount: parseFloat(amount).toFixed(2),
+      creditcard: {
+        cardholder: 'IVR Donor',
+        number: String(cardNumber).replace(/\D/g, ''),
+        expiration: expMo2 + expYr2,
+        cvc: String(cvv).replace(/\D/g, '')
+      },
+      description: description || 'Nishmas IVR Donation',
+      ignore_duplicate: true
+    });
+
+    const options = {
+      hostname: USAEPAY_HOST,
+      path: '/api/v2/transactions',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'Authorization': 'Basic ' + Buffer.from(authStr).toString('base64')
+      }
+    };
+
+    console.log('[USAePay] charging $' + amount + ', card ending ' + String(cardNumber).slice(-4));
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        let parsed;
+        try { parsed = JSON.parse(data); } catch (e) { parsed = { raw: data }; }
+        const approved = parsed?.result === 'Approved' ||
+                         parsed?.result_code === 'A' ||
+                         (parsed?.response && parsed.response.toLowerCase().includes('approved'));
+        const errMsg = parsed?.error || parsed?.error_message || parsed?.errorcode || '';
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          approved,
+          transactionId: parsed?.refnum || parsed?.transaction_id || parsed?.key || '',
+          authCode: parsed?.authcode || '',
+          status: parsed?.result || '',
+          error: errMsg,
+          raw: parsed
+        });
+      });
+    });
+    req.on('error', (err) => {
+      console.error('[USAePay] network error:', err.message);
+      resolve({ ok: false, approved: false, error: err.message });
+    });
+    req.write(body);
+    req.end();
+  });
+}
 
 // Point fluent-ffmpeg at the bundled ffmpeg binary (no system install needed)
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
@@ -155,11 +231,55 @@ async function initDB() {
             ['return_menu_audio_file', 'TEXT'],
             ['closing_message', 'TEXT'],
             ['closing_audio_file', 'TEXT'],
+            ['donation_enabled', 'BOOLEAN DEFAULT true'],
+            ['donation_amount_cents', 'INTEGER DEFAULT 4000'],
+            ['donation_digit', 'TEXT DEFAULT \'9\''],
+            ['donate_intro_audio_file', 'TEXT'],     // "Press 9 to donate $40 ..." main menu prompt
+            ['donate_card_prompt_file', 'TEXT'],     // "Please enter your card number..."
+            ['donate_expiry_prompt_file', 'TEXT'],   // "Please enter expiration month/year..."
+            ['donate_cvv_prompt_file', 'TEXT'],      // "Please enter the security code..."
+            ['donate_kvittel_prompt_file', 'TEXT'],  // "Please record your kvittel name after the beep..."
+            ['donate_thank_you_file', 'TEXT'],       // "Thank you, your donation was approved..."
+            ['donate_decline_file', 'TEXT'],         // "Your card was declined..."
+            ['donate_kvittel_thank_file', 'TEXT'],   // "Thank you, your kvittel has been received..."
             ['is_program_active', 'BOOLEAN DEFAULT true'],
             ['created_at', 'TIMESTAMP DEFAULT NOW()']
         ];
         for (const [col, type] of setCols) {
             await pool.query(`ALTER TABLE nishmas_settings ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
+        }
+
+        // Donations table — log every donation attempt + kvittel recording
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS donations (
+                id SERIAL PRIMARY KEY,
+                amount_cents INTEGER NOT NULL,
+                card_last4 TEXT,
+                status TEXT DEFAULT 'pending',     -- 'approved' | 'declined' | 'pending' | 'error'
+                transaction_id TEXT,
+                auth_code TEXT,
+                decline_reason TEXT,
+                kvittel_recording_url TEXT,
+                caller_phone TEXT,
+                ivr_call_sid TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `).catch(() => {});
+        // Auto-heal donations columns in case the table existed in an older shape
+        const donCols = [
+            ['amount_cents', 'INTEGER'],
+            ['card_last4', 'TEXT'],
+            ['status', "TEXT DEFAULT 'pending'"],
+            ['transaction_id', 'TEXT'],
+            ['auth_code', 'TEXT'],
+            ['decline_reason', 'TEXT'],
+            ['kvittel_recording_url', 'TEXT'],
+            ['caller_phone', 'TEXT'],
+            ['ivr_call_sid', 'TEXT'],
+            ['created_at', 'TIMESTAMP DEFAULT NOW()']
+        ];
+        for (const [col, type] of donCols) {
+            await pool.query(`ALTER TABLE donations ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
         }
 
         const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
@@ -282,6 +402,12 @@ app.post('/webhook', async (req, res) => {
             gather.say('Press 3 for all previous messages.');
             // Press 4 — Nishmas
             gather.say('Press 4 to hear Nishmas.');
+            // Press configurable digit — donate (only if enabled)
+            if (s?.donation_enabled !== false) {
+                gather.pause({ length: 1 });
+                if (s?.donate_intro_audio_file) gather.play(audioBase + s.donate_intro_audio_file);
+                else gather.say('Press ' + (s?.donation_digit || '9') + ' to make a donation.');
+            }
         } else {
             // Skip day (Shabbos / Yom Tov / content not uploaded): no "today's message"
             gather.say('There is no new message today.');
@@ -293,6 +419,12 @@ app.post('/webhook', async (req, res) => {
             }
             gather.say('Press 2 for all previous messages.');
             gather.say('Press 3 to hear Nishmas.');
+            // Press configurable digit — donate (only if enabled)
+            if (s?.donation_enabled !== false) {
+                gather.pause({ length: 1 });
+                if (s?.donate_intro_audio_file) gather.play(audioBase + s.donate_intro_audio_file);
+                else gather.say('Press ' + (s?.donation_digit || '9') + ' to make a donation.');
+            }
         }
 
         twiml.say("We didn't receive your selection. Please try again.");
@@ -406,8 +538,16 @@ app.post('/handle-menu', async (req, res) => {
         };
 
         // --- MENU ROUTING ---
-        // Regular day: 1=today, 2=yesterday, 3=all, 4=nishmas
-        // Skip day:    1=yesterday, 2=all, 3=nishmas
+        // Regular day: 1=today, 2=yesterday, 3=all, 4=nishmas, 9=donate (configurable)
+        // Skip day:    1=yesterday, 2=all, 3=nishmas, 9=donate
+        const settingsForRoute = await pool.query('SELECT donation_digit, donation_enabled FROM nishmas_settings LIMIT 1');
+        const donationDigit = settingsForRoute.rows[0]?.donation_digit || '9';
+        const donationEnabled = settingsForRoute.rows[0]?.donation_enabled !== false;
+        if (donationEnabled && digit === donationDigit) {
+            twiml.redirect('/donate/start');
+            res.type('text/xml').send(twiml.toString());
+            return;
+        }
         if (!isSkipDay) {
             if (digit === '1') {
                 if (todaysMessage) playMessage(todaysMessage, "Here is today's message");
@@ -558,6 +698,226 @@ app.post('/handle-message-selection', async (req, res) => {
     res.type('text/xml').send(twiml.toString());
 });
 
+// ── DONATION FLOW (USAePay) ─────────────────────────────────────────────────
+// Caller hits /donate/start either via menu Press 9, or via end-of-message offer.
+// Flow: Start → card → expmonth → expyear → cvv → process → kvittel record → done
+
+app.all('/donate/start', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const settingsRow = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settingsRow.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const amount = parseFloat((s.donation_amount_cents || 4000) / 100);
+        const callSid = req.body?.CallSid || req.query?.CallSid || '';
+
+        // Pre-create a pending donation row so we can match it later
+        const ins = await pool.query(
+            'INSERT INTO donations (amount_cents, caller_phone, ivr_call_sid, status) VALUES ($1,$2,$3,$4) RETURNING id',
+            [Math.round(amount * 100), req.body?.From || '', callSid, 'pending']
+        );
+        const donationId = ins.rows[0].id;
+
+        // Prompt for card number
+        const gather = twiml.gather({
+            input: 'dtmf',
+            numDigits: 19,
+            finishOnKey: '#',
+            action: '/donate/card?d=' + donationId,
+            method: 'POST',
+            timeout: 30
+        });
+        if (s.donate_card_prompt_file) gather.play(audioBase + s.donate_card_prompt_file);
+        else gather.say('To donate ' + amount + ' dollars, please enter your credit card number using the keypad. Press the pound key when done.');
+        twiml.say("We didn't receive your card number.");
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[donate/start]', e);
+        twiml.say('We are unable to process donations at this time.');
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/donate/card', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const cardDigits = (req.body.Digits || '').replace(/\D/g, '');
+        const donationId = req.query.d;
+        if (cardDigits.length < 13 || cardDigits.length > 19) {
+            twiml.say('That card number does not appear valid.');
+            twiml.redirect('/donate/start');
+            res.type('text/xml').send(twiml.toString());
+            return;
+        }
+        const settingsRow = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settingsRow.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        // Collect 4 digits MMYY (e.g. 0327 = March 2027)
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 4, action: '/donate/expiry?d=' + donationId + '&c=' + cardDigits,
+            method: 'POST', timeout: 20, finishOnKey: '#'
+        });
+        if (s.donate_expiry_prompt_file) gather.play(audioBase + s.donate_expiry_prompt_file);
+        else gather.say('Please enter your card expiration date as four digits — two digits for the month, then two digits for the year.');
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[donate/card]', e);
+        twiml.say('Error processing card.');
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/donate/expiry', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const expDigits = (req.body.Digits || '').replace(/\D/g, '');
+        const card = req.query.c;
+        const donationId = req.query.d;
+        if (expDigits.length !== 4) {
+            twiml.say('Expiration date should be four digits.');
+            twiml.redirect('/donate/start');
+            res.type('text/xml').send(twiml.toString());
+            return;
+        }
+        const expM = expDigits.slice(0, 2);
+        const expY = expDigits.slice(2, 4);
+        const settingsRow = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settingsRow.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 4, action: '/donate/process?d=' + donationId + '&c=' + card + '&em=' + expM + '&ey=' + expY,
+            method: 'POST', timeout: 15, finishOnKey: '#'
+        });
+        if (s.donate_cvv_prompt_file) gather.play(audioBase + s.donate_cvv_prompt_file);
+        else gather.say('Please enter the three or four digit security code on the back of your card.');
+        twiml.redirect('/webhook');
+    } catch (e) { console.error('[donate/expiry]', e); twiml.say('Error.'); twiml.redirect('/webhook'); }
+    res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/donate/process', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const cvv = (req.body.Digits || '').replace(/\D/g, '');
+        const card = req.query.c;
+        const expM = req.query.em;
+        const expY = req.query.ey;
+        const donationId = parseInt(req.query.d);
+        const settingsRow = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
+        const s = settingsRow.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const amount = parseFloat((s.donation_amount_cents || 4000) / 100);
+        const last4 = String(card).slice(-4);
+
+        // Charge USAePay
+        const result = await chargeUSAePay({
+            amount, cardNumber: card, expMonth: expM, expYear: expY, cvv,
+            description: 'Nishmas IVR Donation'
+        });
+
+        // Update donation row
+        await pool.query(
+            'UPDATE donations SET card_last4=$1, status=$2, transaction_id=$3, auth_code=$4, decline_reason=$5 WHERE id=$6',
+            [last4,
+             result.approved ? 'approved' : 'declined',
+             String(result.transactionId || ''),
+             String(result.authCode || ''),
+             result.approved ? null : (result.error || result.status || 'Declined'),
+             donationId]
+        );
+
+        if (result.approved) {
+            // Approved → record kvittel
+            if (s.donate_thank_you_file) twiml.play(audioBase + s.donate_thank_you_file);
+            else twiml.say('Thank you. Your donation of ' + amount + ' dollars has been approved.');
+
+            twiml.pause({ length: 1 });
+            if (s.donate_kvittel_prompt_file) twiml.play(audioBase + s.donate_kvittel_prompt_file);
+            else twiml.say('Please record the kvittel name you would like included, after the beep. Press the pound key when done.');
+
+            twiml.record({
+                action: '/donate/kvittel-saved?d=' + donationId,
+                method: 'POST',
+                maxLength: 60,
+                finishOnKey: '#',
+                playBeep: true,
+                trim: 'trim-silence'
+            });
+            twiml.say('Thank you. Goodbye.');
+            twiml.hangup();
+        } else {
+            // Declined
+            if (s.donate_decline_file) twiml.play(audioBase + s.donate_decline_file);
+            else twiml.say('We were unable to process your card. ' + (result.error || 'Please try again later.'));
+            twiml.pause({ length: 1 });
+            twiml.say('Returning you to the main menu.');
+            twiml.redirect('/webhook');
+        }
+    } catch (e) {
+        console.error('[donate/process]', e);
+        twiml.say('We encountered an error processing your donation.');
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Twilio sends the recorded kvittel here. Save the URL so admin can play it back.
+app.post('/donate/kvittel-saved', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const donationId = parseInt(req.query.d);
+        const recordingUrl = req.body.RecordingUrl;
+        if (recordingUrl && donationId) {
+            await pool.query('UPDATE donations SET kvittel_recording_url=$1 WHERE id=$2', [recordingUrl, donationId]);
+        }
+        const settingsRow = await pool.query('SELECT donate_kvittel_thank_file FROM nishmas_settings LIMIT 1');
+        const s = settingsRow.rows[0] || {};
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        if (s.donate_kvittel_thank_file) twiml.play(audioBase + s.donate_kvittel_thank_file);
+        else twiml.say('Thank you. Your kvittel has been received. May Hashem grant you all the brachos. Goodbye.');
+        twiml.hangup();
+    } catch (e) {
+        console.error('[donate/kvittel-saved]', e);
+        twiml.say('Thank you. Goodbye.');
+        twiml.hangup();
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Admin: list donations (with optional filters)
+app.get('/api/donations', async (req, res) => {
+    try {
+        const r = await pool.query('SELECT * FROM donations ORDER BY created_at DESC LIMIT 1000');
+        res.json(r.rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: donation stats (matches admin UI's expected shape)
+app.get('/api/donations/stats', async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT
+                COALESCE(SUM(amount_cents) FILTER (WHERE status='approved'), 0) AS total_cents,
+                COUNT(*) FILTER (WHERE status='approved') AS approved_count,
+                COUNT(*) FILTER (WHERE status='declined') AS declined_count,
+                COUNT(*) FILTER (WHERE status='approved' AND created_at > NOW() - INTERVAL '24 hours') AS approved_today,
+                COUNT(*) FILTER (WHERE kvittel_recording_url IS NOT NULL AND kvittel_recording_url != '') AS kvittels_recorded
+            FROM donations
+        `);
+        res.json(r.rows[0]);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: delete a donation row (does NOT refund — admin housekeeping only)
+app.delete('/api/donations/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM donations WHERE id=$1', [req.params.id]);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Chunked upload endpoint — splits large files into small pieces to bypass Railway timeout
 const uploadChunks = {};
 
@@ -684,10 +1044,19 @@ app.post('/api/settings', upload.fields([
     { name: 'nishmas_nusach_prompt', maxCount: 1 },
     { name: 'all_messages_intro', maxCount: 1 },
     { name: 'return_menu_audio', maxCount: 1 },
-    { name: 'closing_audio', maxCount: 1 }
+    { name: 'closing_audio', maxCount: 1 },
+    // Donation prompts
+    { name: 'donate_intro_audio', maxCount: 1 },
+    { name: 'donate_card_prompt', maxCount: 1 },
+    { name: 'donate_expiry_prompt', maxCount: 1 },
+    { name: 'donate_cvv_prompt', maxCount: 1 },
+    { name: 'donate_kvittel_prompt', maxCount: 1 },
+    { name: 'donate_thank_you', maxCount: 1 },
+    { name: 'donate_decline', maxCount: 1 },
+    { name: 'donate_kvittel_thank', maxCount: 1 }
 ]), async (req, res) => {
     try {
-        const { program_start_date } = req.body;
+        const { program_start_date, donation_enabled, donation_amount_cents, donation_digit } = req.body;
         const f = {};
         if (req.files) {
             if (req.files.greeting_audio) f.greeting_audio_file = await convertToMp3(req.files.greeting_audio[0].filename);
@@ -701,9 +1070,20 @@ app.post('/api/settings', upload.fields([
             if (req.files.all_messages_intro) f.all_messages_intro_file = await convertToMp3(req.files.all_messages_intro[0].filename);
             if (req.files.return_menu_audio) f.return_menu_audio_file = await convertToMp3(req.files.return_menu_audio[0].filename);
             if (req.files.closing_audio) f.closing_audio_file = await convertToMp3(req.files.closing_audio[0].filename);
+            if (req.files.donate_intro_audio) f.donate_intro_audio_file = await convertToMp3(req.files.donate_intro_audio[0].filename);
+            if (req.files.donate_card_prompt) f.donate_card_prompt_file = await convertToMp3(req.files.donate_card_prompt[0].filename);
+            if (req.files.donate_expiry_prompt) f.donate_expiry_prompt_file = await convertToMp3(req.files.donate_expiry_prompt[0].filename);
+            if (req.files.donate_cvv_prompt) f.donate_cvv_prompt_file = await convertToMp3(req.files.donate_cvv_prompt[0].filename);
+            if (req.files.donate_kvittel_prompt) f.donate_kvittel_prompt_file = await convertToMp3(req.files.donate_kvittel_prompt[0].filename);
+            if (req.files.donate_thank_you) f.donate_thank_you_file = await convertToMp3(req.files.donate_thank_you[0].filename);
+            if (req.files.donate_decline) f.donate_decline_file = await convertToMp3(req.files.donate_decline[0].filename);
+            if (req.files.donate_kvittel_thank) f.donate_kvittel_thank_file = await convertToMp3(req.files.donate_kvittel_thank[0].filename);
         }
         const fields = {};
         if (program_start_date) fields.program_start_date = program_start_date;
+        if (donation_enabled !== undefined) fields.donation_enabled = donation_enabled === 'true' || donation_enabled === true;
+        if (donation_amount_cents !== undefined) fields.donation_amount_cents = parseInt(donation_amount_cents, 10) || 4000;
+        if (donation_digit !== undefined && /^[0-9]$/.test(String(donation_digit))) fields.donation_digit = String(donation_digit);
         Object.assign(fields, f);
         const keys = Object.keys(fields);
         if (keys.length) {
@@ -718,7 +1098,9 @@ app.post('/api/settings', upload.fields([
 app.delete('/api/settings/audio/:field', async (req, res) => {
     const allowed = ['greeting_audio_file','press1_audio_file','press2_audio_file','press3_audio_file',
                      'nishmas_audio_file','nishmas_ashkenaz_file','nishmas_mizrach_file','nishmas_nusach_prompt_file',
-                     'all_messages_intro_file','return_menu_audio_file','closing_audio_file'];
+                     'all_messages_intro_file','return_menu_audio_file','closing_audio_file',
+                     'donate_intro_audio_file','donate_card_prompt_file','donate_expiry_prompt_file','donate_cvv_prompt_file',
+                     'donate_kvittel_prompt_file','donate_thank_you_file','donate_decline_file','donate_kvittel_thank_file'];
     const field = req.params.field;
     if (!allowed.includes(field)) return res.status(400).json({ error: 'Invalid field' });
     try { await pool.query('UPDATE nishmas_settings SET ' + field + ' = NULL WHERE id = (SELECT id FROM nishmas_settings LIMIT 1)'); res.json({ success: true }); }
@@ -1265,8 +1647,154 @@ audio { width: 100%; margin: .5rem 0; filter: invert(0.88) hue-rotate(180deg); }
           </div>
         </div>
 
+        <!-- ─────── DONATIONS ─────── -->
+        <h3 style="margin-top:30px;color:#0f766e;">💛 Donations (USAePay)</h3>
+        <p style="color:#64748b;font-size:14px;margin:5px 0 15px;">Allow callers to donate via the IVR. Configure the digit, amount, and recorded prompts. After a successful charge, the caller is asked to record a kvittel name.</p>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px;background:#f0fdfa;padding:18px;border-radius:8px;border:1px solid #99f6e4;">
+          <div class="form-group" style="margin:0;">
+            <label>Donation Enabled</label>
+            <select name="donation_enabled" id="donationEnabled" style="padding:8px;border-radius:6px;border:1px solid #cbd5e1;">
+              <option value="true">Yes — allow donations</option>
+              <option value="false">No — hide from menu</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label>Amount ($)</label>
+            <input type="number" name="donation_amount_dollars" id="donationAmount" min="1" step="1" style="padding:8px;border-radius:6px;border:1px solid #cbd5e1;" placeholder="40">
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label>Menu Digit</label>
+            <input type="text" name="donation_digit" id="donationDigit" maxlength="1" pattern="[0-9]" style="padding:8px;border-radius:6px;border:1px solid #cbd5e1;" placeholder="9">
+          </div>
+        </div>
+
+        <div class="form-grid">
+          <div class="form-group">
+            <label>1. Donation Intro Prompt</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "Press 9 to donate $40 to sponsor today's video"</p>
+            <div class="upload-area" id="donateIntroArea">
+              <div class="upload-icon">💛</div>
+              <div class="upload-text">Upload donation intro prompt</div>
+              <input type="file" id="donateIntroAudio" name="donate_intro_audio" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="donateIntroAudio" data-area="donateIntroArea" data-preview="donateIntroPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="donateIntroPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="donateIntroAudio" data-preview="donateIntroPreview" data-area="donateIntroArea">🗑️</button></div></div>
+            <div id="current-donateIntro"></div>
+          </div>
+
+          <div class="form-group">
+            <label>2. Card Number Prompt</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "Please enter your credit card number, press # when done"</p>
+            <div class="upload-area" id="donateCardArea">
+              <div class="upload-icon">💳</div>
+              <div class="upload-text">Upload card prompt</div>
+              <input type="file" id="donateCardPrompt" name="donate_card_prompt" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="donateCardPrompt" data-area="donateCardArea" data-preview="donateCardPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="donateCardPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="donateCardPrompt" data-preview="donateCardPreview" data-area="donateCardArea">🗑️</button></div></div>
+            <div id="current-donateCard"></div>
+          </div>
+
+          <div class="form-group">
+            <label>3. Expiry Date Prompt</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "Enter expiry as 4 digits — month then year"</p>
+            <div class="upload-area" id="donateExpiryArea">
+              <div class="upload-icon">📅</div>
+              <div class="upload-text">Upload expiry prompt</div>
+              <input type="file" id="donateExpiryPrompt" name="donate_expiry_prompt" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="donateExpiryPrompt" data-area="donateExpiryArea" data-preview="donateExpiryPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="donateExpiryPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="donateExpiryPrompt" data-preview="donateExpiryPreview" data-area="donateExpiryArea">🗑️</button></div></div>
+            <div id="current-donateExpiry"></div>
+          </div>
+
+          <div class="form-group">
+            <label>4. CVV Prompt</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "Enter the 3 or 4 digit security code"</p>
+            <div class="upload-area" id="donateCvvArea">
+              <div class="upload-icon">🔒</div>
+              <div class="upload-text">Upload CVV prompt</div>
+              <input type="file" id="donateCvvPrompt" name="donate_cvv_prompt" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="donateCvvPrompt" data-area="donateCvvArea" data-preview="donateCvvPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="donateCvvPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="donateCvvPrompt" data-preview="donateCvvPreview" data-area="donateCvvArea">🗑️</button></div></div>
+            <div id="current-donateCvv"></div>
+          </div>
+
+          <div class="form-group">
+            <label>5. Thank You (after charge approved)</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "Thank you, your donation has been processed"</p>
+            <div class="upload-area" id="donateThankArea">
+              <div class="upload-icon">🙏</div>
+              <div class="upload-text">Upload thank-you prompt</div>
+              <input type="file" id="donateThankYou" name="donate_thank_you" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="donateThankYou" data-area="donateThankArea" data-preview="donateThankPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="donateThankPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="donateThankYou" data-preview="donateThankPreview" data-area="donateThankArea">🗑️</button></div></div>
+            <div id="current-donateThank"></div>
+          </div>
+
+          <div class="form-group">
+            <label>6. Decline Message (charge failed)</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "Sorry, your card was declined"</p>
+            <div class="upload-area" id="donateDeclineArea">
+              <div class="upload-icon">⚠️</div>
+              <div class="upload-text">Upload decline message</div>
+              <input type="file" id="donateDecline" name="donate_decline" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="donateDecline" data-area="donateDeclineArea" data-preview="donateDeclinePreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="donateDeclinePreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="donateDecline" data-preview="donateDeclinePreview" data-area="donateDeclineArea">🗑️</button></div></div>
+            <div id="current-donateDecline"></div>
+          </div>
+
+          <div class="form-group">
+            <label>7. Kvittel Recording Prompt</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "Please record the name for your kvittel after the beep, press # when done"</p>
+            <div class="upload-area" id="donateKvittelArea">
+              <div class="upload-icon">📝</div>
+              <div class="upload-text">Upload kvittel prompt</div>
+              <input type="file" id="donateKvittelPrompt" name="donate_kvittel_prompt" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="donateKvittelPrompt" data-area="donateKvittelArea" data-preview="donateKvittelPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="donateKvittelPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="donateKvittelPrompt" data-preview="donateKvittelPreview" data-area="donateKvittelArea">🗑️</button></div></div>
+            <div id="current-donateKvittel"></div>
+          </div>
+
+          <div class="form-group">
+            <label>8. Kvittel Thank You</label>
+            <p style="font-size:12px;color:#64748b;margin:0 0 8px;">e.g. "Thank you, your kvittel has been recorded"</p>
+            <div class="upload-area" id="donateKvittelThankArea">
+              <div class="upload-icon">💛</div>
+              <div class="upload-text">Upload kvittel thank-you</div>
+              <input type="file" id="donateKvittelThank" name="donate_kvittel_thank" accept="audio/*" style="display:none">
+            </div>
+            <div class="or-divider">— or —</div>
+            <div class="record-row"><button type="button" class="record-btn" data-target="donateKvittelThank" data-area="donateKvittelThankArea" data-preview="donateKvittelThankPreview"><span class="icon">🎙️</span><span class="label">Record</span></button></div>
+            <div class="recorded-preview" id="donateKvittelThankPreview"><div class="recorded-preview-label">✅ Recording ready</div><div class="recorded-preview-row"><audio controls></audio><button type="button" class="delete-icon-btn" data-discard="donateKvittelThank" data-preview="donateKvittelThankPreview" data-area="donateKvittelThankArea">🗑️</button></div></div>
+            <div id="current-donateKvittelThank"></div>
+          </div>
+        </div>
+
         <button type="submit" class="btn btn-success btn-full">💾 Save All Audio Settings</button>
       </form>
+
+      <!-- ─────── DONATIONS HISTORY ─────── -->
+      <div class="section-card" id="donationsCard" style="margin-top:30px;">
+        <h3 style="color:#0f766e;margin-top:0;">📊 Donations History</h3>
+        <div id="donationStats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:18px;">
+          <!-- filled by JS -->
+        </div>
+        <button type="button" class="btn" onclick="loadDonations()" style="margin-bottom:10px;">🔄 Refresh</button>
+        <div id="donationsList" style="max-height:500px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:8px;"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -1414,7 +1942,72 @@ async function loadSettings() {
     showCurrentAudio('nishmas_nusach_prompt_file', 'current-nishmas-nusach-prompt', 'Current Nusach Selection Prompt');
     showCurrentAudio('all_messages_intro_file', 'current-all-intro', 'Current Menu Intro');
     showCurrentAudio('return_menu_audio_file', 'current-return', 'Current Return Menu Audio');
+
+    // Donation settings
+    if (document.getElementById('donationEnabled')) {
+      document.getElementById('donationEnabled').value = (currentSettings.donation_enabled === false) ? 'false' : 'true';
+      document.getElementById('donationAmount').value = ((currentSettings.donation_amount_cents || 4000) / 100).toFixed(0);
+      document.getElementById('donationDigit').value = currentSettings.donation_digit || '9';
+      showCurrentAudio('donate_intro_audio_file', 'current-donateIntro', 'Current Donation Intro');
+      showCurrentAudio('donate_card_prompt_file', 'current-donateCard', 'Current Card Prompt');
+      showCurrentAudio('donate_expiry_prompt_file', 'current-donateExpiry', 'Current Expiry Prompt');
+      showCurrentAudio('donate_cvv_prompt_file', 'current-donateCvv', 'Current CVV Prompt');
+      showCurrentAudio('donate_thank_you_file', 'current-donateThank', 'Current Thank You');
+      showCurrentAudio('donate_decline_file', 'current-donateDecline', 'Current Decline Message');
+      showCurrentAudio('donate_kvittel_prompt_file', 'current-donateKvittel', 'Current Kvittel Prompt');
+      showCurrentAudio('donate_kvittel_thank_file', 'current-donateKvittelThank', 'Current Kvittel Thank You');
+    }
+    loadDonations();
   } catch (e) { console.error(e); }
+}
+
+async function loadDonations() {
+  try {
+    const [statsR, listR] = await Promise.all([
+      fetch('/api/donations/stats'),
+      fetch('/api/donations')
+    ]);
+    const stats = await statsR.json();
+    const donations = await listR.json();
+
+    const totalDollars = ((parseInt(stats.total_cents)||0) / 100).toFixed(2);
+    document.getElementById('donationStats').innerHTML =
+      '<div style="background:#fff;padding:14px;border-radius:8px;border:1px solid #e2e8f0;"><div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">Total Raised</div><div style="font-size:24px;font-weight:700;color:#0f766e;margin-top:4px;">$' + totalDollars + '</div></div>' +
+      '<div style="background:#fff;padding:14px;border-radius:8px;border:1px solid #e2e8f0;"><div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">Approved</div><div style="font-size:24px;font-weight:700;color:#15803d;margin-top:4px;">' + (stats.approved_count||0) + '</div></div>' +
+      '<div style="background:#fff;padding:14px;border-radius:8px;border:1px solid #e2e8f0;"><div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">Today</div><div style="font-size:24px;font-weight:700;color:#1e293b;margin-top:4px;">' + (stats.approved_today||0) + '</div></div>' +
+      '<div style="background:#fff;padding:14px;border-radius:8px;border:1px solid #e2e8f0;"><div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">Declined</div><div style="font-size:24px;font-weight:700;color:#dc2626;margin-top:4px;">' + (stats.declined_count||0) + '</div></div>' +
+      '<div style="background:#fff;padding:14px;border-radius:8px;border:1px solid #e2e8f0;"><div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">Kvittels Recorded</div><div style="font-size:24px;font-weight:700;color:#7c3aed;margin-top:4px;">' + (stats.kvittels_recorded||0) + '</div></div>';
+
+    if (!donations.length) {
+      document.getElementById('donationsList').innerHTML = '<div style="padding:30px;text-align:center;color:#64748b;">No donations yet.</div>';
+      return;
+    }
+    document.getElementById('donationsList').innerHTML = donations.map(d => {
+      const dollars = (d.amount_cents/100).toFixed(2);
+      const isApproved = d.status === 'approved';
+      const statusBadge = isApproved
+        ? '<span style="background:#dcfce7;color:#15803d;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">✓ APPROVED</span>'
+        : '<span style="background:#fee2e2;color:#dc2626;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">✗ DECLINED</span>';
+      const kvittelHtml = d.kvittel_recording_url
+        ? '<audio controls preload="none" style="height:30px;width:100%;max-width:280px;"><source src="' + d.kvittel_recording_url + '.mp3"></audio>'
+        : '<span style="font-size:12px;color:#94a3b8;">No kvittel recording</span>';
+      return '<div style="padding:12px 14px;border-bottom:1px solid #e2e8f0;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">' +
+          '<div style="flex:1;min-width:180px;">' +
+            '<div style="font-weight:600;color:#1e293b;font-size:15px;">$' + dollars + ' &nbsp;' + statusBadge + '</div>' +
+            '<div style="font-size:12px;color:#64748b;margin-top:3px;">' +
+              new Date(d.created_at).toLocaleString() +
+              (d.caller_phone ? ' · ' + d.caller_phone : '') +
+              (d.card_last4 ? ' · ****' + d.card_last4 : '') +
+              (d.transaction_id ? ' · TX: ' + d.transaction_id : '') +
+            '</div>' +
+            (d.decline_reason ? '<div style="font-size:12px;color:#dc2626;margin-top:3px;">⚠️ ' + d.decline_reason + '</div>' : '') +
+          '</div>' +
+          '<div style="flex:1;min-width:200px;">' + kvittelHtml + '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  } catch (e) { console.error('loadDonations:', e); }
 }
 
 function showCurrentAudio(key, containerId, label) {
@@ -1706,6 +2299,15 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
   e.preventDefault();
   const fd = new FormData();
   fd.append('program_start_date', document.getElementById('startDate').value);
+  // Donation non-audio settings
+  const donationEnabledEl = document.getElementById('donationEnabled');
+  if (donationEnabledEl) {
+    fd.append('donation_enabled', donationEnabledEl.value);
+    const dollars = parseFloat(document.getElementById('donationAmount').value || '40');
+    fd.append('donation_amount_cents', String(Math.round(dollars * 100)));
+    const digit = (document.getElementById('donationDigit').value || '9').trim();
+    if (/^[0-9]$/.test(digit)) fd.append('donation_digit', digit);
+  }
   [
     ['greetingAudio', 'greeting_audio'],
     ['press1Audio', 'press1_audio'],
@@ -1715,7 +2317,16 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     ['nishmasMizrach', 'nishmas_mizrach'],
     ['nishmasNusachPrompt', 'nishmas_nusach_prompt'],
     ['allMessagesIntro', 'all_messages_intro'],
-    ['returnMenuAudio', 'return_menu_audio']
+    ['returnMenuAudio', 'return_menu_audio'],
+    // Donation prompts
+    ['donateIntroAudio', 'donate_intro_audio'],
+    ['donateCardPrompt', 'donate_card_prompt'],
+    ['donateExpiryPrompt', 'donate_expiry_prompt'],
+    ['donateCvvPrompt', 'donate_cvv_prompt'],
+    ['donateThankYou', 'donate_thank_you'],
+    ['donateDecline', 'donate_decline'],
+    ['donateKvittelPrompt', 'donate_kvittel_prompt'],
+    ['donateKvittelThank', 'donate_kvittel_thank']
   ].forEach(([inputId, fieldName]) => {
     const el = document.getElementById(inputId);
     if (!el) return;
