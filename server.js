@@ -465,12 +465,7 @@ app.post('/webhook', async (req, res) => {
             else gather.say('To donate ' + ((s?.donation_amount_cents || 8000) / 100).toFixed(0) + ' dollars and have a kvittel said for you, press ' + (s?.kvittel_digit || '8') + '.');
             gather.pause({ length: 1 });
         }
-        if (s?.sponsor_enabled !== false) {
-            // Sponsor a video prompt (press 9 by default)
-            if (s?.sponsor_intro_audio_file) gather.play(audioBase + s.sponsor_intro_audio_file);
-            else gather.say('To sponsor a daily video that will be a source of chizuk for tens of thousands across the globe, press ' + (s?.sponsor_digit || '9') + '.');
-            gather.pause({ length: 1 });
-        }
+      
 
         // 2. Day announcement OR skip-day announcement
         if (todaysMessage) {
