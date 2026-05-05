@@ -9,79 +9,72 @@ const https = require('https');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 
-// ── USAePay credentials ─────────────────────────────────────────────────────
-const USAEPAY_SOURCE_KEY = process.env.USAEPAY_SOURCE_KEY || 'X1YgGedt7JxvZ5JDjjWPV9MKL9Ihx268';
-const USAEPAY_PIN        = process.env.USAEPAY_PIN        || '4321';
-const USAEPAY_HOST       = process.env.USAEPAY_HOST       || 'usaepay.com'; // production host
-const DONATION_AMOUNT    = parseFloat(process.env.DONATION_AMOUNT || '80');  // $80 default
+// ── Sola Payments credentials ───────────────────────────────────────────────
+// Set SOLA_KEY in Railway env vars (your xKey from the Sola merchant portal).
+const SOLA_KEY            = process.env.SOLA_KEY            || '996jI7CEk55YgDan1C208Z1ZSETzMA4I';
+const SOLA_HOST           = process.env.SOLA_HOST           || 'x1.cardknox.com'; // x1=primary, x2/b1=backup
+const SOLA_SOFTWARE_NAME  = process.env.SOLA_SOFTWARE_NAME  || 'NishmasIVR';
+const SOLA_SOFTWARE_VER   = process.env.SOLA_SOFTWARE_VER   || '1.0.0';
+const DONATION_AMOUNT     = parseFloat(process.env.DONATION_AMOUNT || '80'); // $80 default
 
-// Charge a card via USAePay v2 REST. Returns { ok, approved, transactionId, error }
-async function chargeUSAePay({ amount, cardNumber, expMonth, expYear, cvv, description }) {
+// Charge a card via Sola (Cardknox) gateway. Returns { ok, approved, transactionId, error }
+async function chargeSola({ amount, cardNumber, expMonth, expYear, cvv, description, invoice }) {
   return new Promise((resolve) => {
-    // USAePay v2 REST API auth format (per https://help.usaepay.info/api/rest/):
-    //   prehash = apikey + seed + apipin
-    //   apihash = 's2/' + seed + '/' + sha256(prehash)
-    //   Authorization: Basic base64(apikey + ':' + apihash)
-    const crypto = require('crypto');
-    const seed = crypto.randomBytes(16).toString('hex'); // random seed
-    const prehash = USAEPAY_SOURCE_KEY + seed + USAEPAY_PIN;
-    const apihash = 's2/' + seed + '/' + crypto.createHash('sha256').update(prehash).digest('hex');
-    const authStr = USAEPAY_SOURCE_KEY + ':' + apihash;
-
     const expMo2 = String(expMonth).padStart(2, '0').slice(-2);
     const expYr2 = String(expYear).length >= 4 ? String(expYear).slice(-2) : String(expYear).padStart(2, '0').slice(-2);
 
     const body = JSON.stringify({
-      command: 'cc:sale',
-      amount: parseFloat(amount).toFixed(2),
-      creditcard: {
-        cardholder: 'IVR Donor',
-        number: String(cardNumber).replace(/\D/g, ''),
-        expiration: expMo2 + expYr2,
-        cvc: String(cvv).replace(/\D/g, '')
-      },
-      description: description || 'Nishmas IVR Donation',
-      ignore_duplicate: true
+      xKey: SOLA_KEY,
+      xVersion: '5.0.0',
+      xSoftwareName: SOLA_SOFTWARE_NAME,
+      xSoftwareVersion: SOLA_SOFTWARE_VER,
+      xCommand: 'cc:sale',
+      xAmount: parseFloat(amount).toFixed(2),
+      xCardNum: String(cardNumber).replace(/\D/g, ''),
+      xExp: expMo2 + expYr2,
+      xCVV: String(cvv).replace(/\D/g, ''),
+      xName: 'IVR Donor',
+      xDescription: description || 'Nishmas IVR Donation',
+      xInvoice: invoice || ('NISHMAS-' + Date.now()),
+      xAllowDuplicate: 'TRUE'
     });
 
     const options = {
-      hostname: USAEPAY_HOST,
-      path: '/api/v2/transactions',
+      hostname: SOLA_HOST,
+      path: '/gatewayjson',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-        'Authorization': 'Basic ' + Buffer.from(authStr).toString('base64')
+        'Content-Length': Buffer.byteLength(body)
       }
     };
 
-    console.log('[USAePay] charging $' + amount + ', card ending ' + String(cardNumber).slice(-4));
+    console.log('[Sola] charging $' + amount + ', card ending ' + String(cardNumber).slice(-4));
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        console.log('[USAePay] HTTP status:', res.statusCode);
-        console.log('[USAePay] response body:', data);
+        console.log('[Sola] HTTP status:', res.statusCode);
+        console.log('[Sola] response body:', data);
         let parsed;
         try { parsed = JSON.parse(data); } catch (e) { parsed = { raw: data }; }
-        const approved = parsed?.result === 'Approved' ||
-                         parsed?.result_code === 'A' ||
-                         (parsed?.response && parsed.response.toLowerCase().includes('approved'));
-        const errMsg = parsed?.error || parsed?.error_message || parsed?.errorcode || parsed?.detail || '';
-        console.log('[USAePay] approved:', approved, '· result:', parsed?.result, '· error:', errMsg);
+        // Sola: xResult = 'A' (Approved), 'D' (Declined), 'E' (Error)
+        const approved = parsed?.xResult === 'A';
+        const errMsg = parsed?.xError || parsed?.xStatus || '';
+        console.log('[Sola] approved:', approved, '· status:', parsed?.xStatus, '· error:', errMsg);
         resolve({
           ok: res.statusCode >= 200 && res.statusCode < 300,
           approved,
-          transactionId: parsed?.refnum || parsed?.transaction_id || parsed?.key || '',
-          authCode: parsed?.authcode || '',
-          status: parsed?.result || '',
+          transactionId: parsed?.xRefNum || '',
+          authCode: parsed?.xAuthCode || '',
+          status: parsed?.xStatus || '',
           error: errMsg,
           raw: parsed
         });
       });
     });
     req.on('error', (err) => {
-      console.error('[USAePay] network error:', err.message);
+      console.error('[Sola] network error:', err.message);
       resolve({ ok: false, approved: false, error: err.message });
     });
     req.write(body);
@@ -858,10 +851,11 @@ app.post('/donate/process', async (req, res) => {
         const amount = parseFloat((s.donation_amount_cents || 8000) / 100);
         const last4 = String(card).slice(-4);
 
-        // Charge USAePay
-        const result = await chargeUSAePay({
+        // Charge via Sola Payments
+        const result = await chargeSola({
             amount, cardNumber: card, expMonth: expM, expYear: expY, cvv,
-            description: 'Nishmas IVR Donation'
+            description: 'Nishmas IVR Donation',
+            invoice: 'NISHMAS-' + donationId
         });
 
         // Update donation row
