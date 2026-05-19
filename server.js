@@ -304,6 +304,95 @@ async function initDB() {
         for (const [col, type] of donCols) {
             await pool.query(`ALTER TABLE donations ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
         }
+        // Add campaign_id to donations so each transaction can be traced back to
+        // its donation campaign (NULL for legacy donations from the original $80 flow).
+        await pool.query('ALTER TABLE donations ADD COLUMN IF NOT EXISTS campaign_id INTEGER').catch(() => {});
+
+        // ─── Donation campaigns: multiple "press X to donate $Y to <cause>" entries ───
+        // Each campaign owns its own digit, preset amount, full audio bundle, and
+        // kvittel toggle. At call time /webhook plays every active campaign's intro;
+        // /handle-menu dispatches the pressed digit into /donate2/start?campaign=<id>.
+        // Existing $80 nishmas flow is auto-seeded as the first campaign so nothing
+        // breaks in production — see seed block below.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS donation_campaigns (
+                id                          SERIAL PRIMARY KEY,
+                name                        TEXT NOT NULL,                -- internal label, e.g. "Nishmas $80 + kvittel"
+                digit                       TEXT NOT NULL,                -- single keypad digit '0'-'9'
+                amount_cents                INTEGER NOT NULL,
+                description                 TEXT,                         -- e.g. "Donate $104 to XYZ" (admin reference only)
+                intro_audio_file            TEXT,                         -- "To donate X to XYZ press 9" (played in main menu)
+                card_prompt_file            TEXT,                         -- "Please enter your card number..."
+                expiry_prompt_file          TEXT,                         -- "Please enter expiration date..."
+                cvv_prompt_file             TEXT,                         -- "Please enter the security code..."
+                thank_you_file              TEXT,                         -- "Thank you, your donation was approved"
+                decline_file                TEXT,                         -- "Your card was declined..."
+                kvittel_enabled             BOOLEAN DEFAULT FALSE,        -- record a kvittel after approval?
+                kvittel_prompt_file         TEXT,                         -- "Please record your kvittel name..."
+                kvittel_thank_file          TEXT,                         -- "Thank you, your kvittel has been received"
+                active                      BOOLEAN DEFAULT TRUE,
+                sort_order                  INTEGER DEFAULT 0,
+                created_at                  TIMESTAMP DEFAULT NOW(),
+                updated_at                  TIMESTAMP DEFAULT NOW()
+            )
+        `).catch(() => {});
+
+        // Auto-heal donation_campaigns columns
+        const dcCols = [
+            ['name', 'TEXT'], ['digit', 'TEXT'], ['amount_cents', 'INTEGER'],
+            ['description', 'TEXT'],
+            ['intro_audio_file', 'TEXT'], ['card_prompt_file', 'TEXT'],
+            ['expiry_prompt_file', 'TEXT'], ['cvv_prompt_file', 'TEXT'],
+            ['thank_you_file', 'TEXT'], ['decline_file', 'TEXT'],
+            ['kvittel_enabled', 'BOOLEAN DEFAULT FALSE'],
+            ['kvittel_prompt_file', 'TEXT'], ['kvittel_thank_file', 'TEXT'],
+            ['active', 'BOOLEAN DEFAULT TRUE'], ['sort_order', 'INTEGER DEFAULT 0'],
+            ['created_at', 'TIMESTAMP DEFAULT NOW()'],
+            ['updated_at', 'TIMESTAMP DEFAULT NOW()'],
+        ];
+        for (const [col, type] of dcCols) {
+            await pool.query(`ALTER TABLE donation_campaigns ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
+        }
+
+        // Seed: if no campaigns exist yet but the legacy nishmas_settings has the
+        // $80 donate flow enabled, port it over as campaign #1. This keeps the
+        // production phone line behaving identically after the migration.
+        try {
+            const existingCount = await pool.query('SELECT COUNT(*)::int AS n FROM donation_campaigns');
+            if ((existingCount.rows[0]?.n || 0) === 0) {
+                const ns = (await pool.query('SELECT * FROM nishmas_settings LIMIT 1')).rows[0] || {};
+                if (ns.donation_enabled !== false) {
+                    await pool.query(
+                        `INSERT INTO donation_campaigns
+                          (name, digit, amount_cents, description,
+                           intro_audio_file, card_prompt_file, expiry_prompt_file,
+                           cvv_prompt_file, thank_you_file, decline_file,
+                           kvittel_enabled, kvittel_prompt_file, kvittel_thank_file,
+                           active, sort_order)
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+                        [
+                            'Nishmas — kvittel donation (legacy import)',
+                            ns.kvittel_digit || ns.donation_digit || '8',
+                            ns.donation_amount_cents || 8000,
+                            'Original $80-and-have-a-kvittel-said-for-you flow.',
+                            ns.donate_intro_audio_file || null,
+                            ns.donate_card_prompt_file || null,
+                            ns.donate_expiry_prompt_file || null,
+                            ns.donate_cvv_prompt_file || null,
+                            ns.donate_thank_you_file || null,
+                            ns.donate_decline_file || null,
+                            true,                                       // kvittel enabled for nishmas
+                            ns.donate_kvittel_prompt_file || null,
+                            ns.donate_kvittel_thank_file || null,
+                            true, 0
+                        ]
+                    );
+                    console.log('[migration] seeded Nishmas $80 + kvittel flow as donation_campaigns row #1');
+                }
+            }
+        } catch (e) {
+            console.error('[migration] donation_campaigns seed failed:', e.message);
+        }
 
         // Sponsorships table — full $500 or partial $180 sponsorships, optionally tied to a day
         await pool.query(`
@@ -451,7 +540,7 @@ app.post('/webhook', async (req, res) => {
             gather.say('Welcome to the 40 Days of Nishmas program.');
         }
 
-        // 1b. Sponsor + Kvittel prompts — play right after welcome, before menu options
+        // 1b. Sponsor + Donation campaign prompts — play right after welcome, before menu options
         if (s?.sponsor_enabled !== false) {
             gather.pause({ length: 1 });
             // Sponsor prompt (press 9 by default) — admin-uploadable intro about sponsoring a daily video
@@ -459,8 +548,31 @@ app.post('/webhook', async (req, res) => {
             else gather.say('To sponsor a daily video that will be a source of chizuk for tens of thousands across the globe, press ' + (s?.sponsor_digit || '9') + '.');
             gather.pause({ length: 1 });
         }
-        if (s?.donation_enabled !== false) {
-            // Kvittel/donate prompt (press 8 by default)
+
+        // Donation campaigns — each row in donation_campaigns is one "press X to donate $Y to <cause>" option.
+        // Multiple campaigns can be active simultaneously; each plays its own intro audio in sort order.
+        // If the campaigns table is empty (fresh install before migration), fall back to the legacy single-donation prompt.
+        let dcRows = [];
+        try {
+            const dcRes = await pool.query(
+                "SELECT * FROM donation_campaigns WHERE active = TRUE ORDER BY sort_order ASC, id ASC"
+            );
+            dcRows = dcRes.rows || [];
+        } catch (e) { /* table may not exist yet on very old DBs — fall through to legacy */ }
+
+        if (dcRows.length > 0) {
+            for (const c of dcRows) {
+                if (c.intro_audio_file) {
+                    gather.play(audioBase + c.intro_audio_file);
+                } else {
+                    const dollars = ((c.amount_cents || 0) / 100).toFixed(0);
+                    const causeLabel = c.description || c.name || 'this cause';
+                    gather.say('To donate ' + dollars + ' dollars to ' + causeLabel + ', press ' + (c.digit || '8') + '.');
+                }
+                gather.pause({ length: 1 });
+            }
+        } else if (s?.donation_enabled !== false) {
+            // Legacy single-donation prompt (only reached if donation_campaigns is empty/uninitialized)
             if (s?.donate_intro_audio_file) gather.play(audioBase + s.donate_intro_audio_file);
             else gather.say('To donate ' + ((s?.donation_amount_cents || 8000) / 100).toFixed(0) + ' dollars and have a kvittel said for you, press ' + (s?.kvittel_digit || '8') + '.');
             gather.pause({ length: 1 });
@@ -528,15 +640,35 @@ app.post('/handle-menu', async (req, res) => {
         const kvittelDigitNow = ms.kvittel_digit || ms.donation_digit || '8';
         const sponsorDigitNow = ms.sponsor_digit || '9';
 
-        // Helper: at the end of any played message, prompt sponsor / kvittel / menu
+        // Preload donation campaigns so the sync promptPostMessage helper can reference them
+        let postCampaigns = [];
+        try {
+            const dcAll = await pool.query(
+                "SELECT * FROM donation_campaigns WHERE active = TRUE ORDER BY sort_order ASC, id ASC"
+            );
+            postCampaigns = dcAll.rows || [];
+        } catch (e) { /* ignore — table may not exist yet */ }
+
+        // Helper: at the end of any played message, prompt sponsor / donation campaigns / menu
         const promptPostMessage = () => {
-            if (sponsorOn || donationOn) {
+            const hasCampaigns = postCampaigns.length > 0;
+            if (sponsorOn || donationOn || hasCampaigns) {
                 const g = twiml.gather({ numDigits: 1, action: '/handle-post-message', method: 'POST', timeout: 10 });
-                // Play uploaded prompts first if available
                 if (sponsorOn && ms.sponsor_intro_audio_file) g.play(audioBase + ms.sponsor_intro_audio_file);
                 else if (sponsorOn) g.say('To sponsor a daily video, press ' + sponsorDigitNow + '.');
-                if (donationOn && ms.donate_intro_audio_file) g.play(audioBase + ms.donate_intro_audio_file);
+
+                if (hasCampaigns) {
+                    for (const c of postCampaigns) {
+                        if (c.intro_audio_file) g.play(audioBase + c.intro_audio_file);
+                        else {
+                            const dollars = ((c.amount_cents || 0) / 100).toFixed(0);
+                            const causeLabel = c.description || c.name || 'this cause';
+                            g.say('To donate ' + dollars + ' dollars to ' + causeLabel + ', press ' + (c.digit || '8') + '.');
+                        }
+                    }
+                } else if (donationOn && ms.donate_intro_audio_file) g.play(audioBase + ms.donate_intro_audio_file);
                 else if (donationOn) g.say('To donate ' + ((ms.donation_amount_cents || 8000) / 100).toFixed(0) + ' dollars and have a kvittel said for you, press ' + kvittelDigitNow + '.');
+
                 g.say('Press 0 to return to the main menu.');
                 twiml.redirect('/webhook');
             } else {
@@ -641,6 +773,20 @@ app.post('/handle-menu', async (req, res) => {
         };
 
         // --- MENU ROUTING ---
+        // Donation campaigns take first priority on digit dispatch. If the pressed
+        // digit matches any active campaign, route to /donate2/start?c=<id>.
+        try {
+            const dcMatch = await pool.query(
+                "SELECT id FROM donation_campaigns WHERE active = TRUE AND digit = $1 ORDER BY sort_order ASC, id ASC LIMIT 1",
+                [String(digit || '')]
+            );
+            if (dcMatch.rows[0]) {
+                twiml.redirect('/donate2/start?c=' + dcMatch.rows[0].id);
+                res.type('text/xml').send(twiml.toString());
+                return;
+            }
+        } catch (e) { /* fall through to legacy */ }
+
         // Regular day: 1=today, 2=yesterday, 3=all, 4=nishmas
         // Press 8 (kvittel_digit) = donate $80 + kvittel; Press 9 (sponsor_digit) = sponsor a video
         const settingsForRoute = await pool.query('SELECT donation_digit, kvittel_digit, donation_enabled, sponsor_digit, sponsor_enabled FROM nishmas_settings LIMIT 1');
@@ -936,7 +1082,7 @@ app.post('/donate/expiry', async (req, res) => {
             method: 'POST', timeout: 20, finishOnKey: '#'
         });
         if (s.donate_cvv_prompt_file) gather.play(audioBase + s.donate_cvv_prompt_file);
-        else gather.say('Please enter the day number you would like to sponsor, from 1 to 40, then press the pound key. To sponsor with no specific day, just press the pound key.');
+        else gather.say('Please enter the three or four digit security code on the back of your card, then press the pound key.');
         twiml.redirect('/webhook');
     } catch (e) { console.error('[donate/expiry]', e); twiml.say('Error.'); twiml.redirect('/webhook'); }
     res.type('text/xml').send(twiml.toString());
@@ -1041,6 +1187,255 @@ app.post('/donate/kvittel-saved', async (req, res) => {
         twiml.hangup();
     } catch (e) {
         console.error('[donate/kvittel-saved]', e);
+        twiml.say('Thank you. Goodbye.');
+        twiml.hangup();
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DONATE2 — multi-campaign generic donation flow
+// Each call carries the campaign_id in a query string (?c=<id>) so the
+// audio prompts and amount are pulled from donation_campaigns instead of
+// being hardcoded in nishmas_settings. Old /donate/* routes remain as
+// fallback for the legacy single-flow setup.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Tiny helper: fetch a campaign by id (or null) — used by every donate2 step
+async function getCampaign(campaignId) {
+    if (!campaignId) return null;
+    const r = await pool.query('SELECT * FROM donation_campaigns WHERE id = $1', [campaignId]);
+    return r.rows[0] || null;
+}
+
+// Step 1: caller pressed the campaign's digit on the main menu (or post-message).
+// We create a pending donation row tied to this campaign, then prompt for card.
+app.all('/donate2/start', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const cid = parseInt(req.query.c, 10);
+        const c = await getCampaign(cid);
+        if (!c) {
+            twiml.say('We are unable to process donations at this time.');
+            twiml.redirect('/webhook');
+            res.type('text/xml').send(twiml.toString());
+            return;
+        }
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const callSid = req.body?.CallSid || req.query?.CallSid || '';
+        const amount = (c.amount_cents || 0) / 100;
+
+        // Pre-create a pending donation row so we can match the charge result
+        // to a row in the donations table. Note: campaign_id column was added
+        // by the migration; for older DBs we still try to insert and gracefully
+        // fall back if the column doesn't exist.
+        let donationId;
+        try {
+            const ins = await pool.query(
+                'INSERT INTO donations (amount_cents, caller_phone, ivr_call_sid, status, campaign_id) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+                [c.amount_cents, req.body?.From || '', callSid, 'pending', cid]
+            );
+            donationId = ins.rows[0].id;
+        } catch (e) {
+            const ins = await pool.query(
+                'INSERT INTO donations (amount_cents, caller_phone, ivr_call_sid, status) VALUES ($1,$2,$3,$4) RETURNING id',
+                [c.amount_cents, req.body?.From || '', callSid, 'pending']
+            );
+            donationId = ins.rows[0].id;
+        }
+
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 19, finishOnKey: '#',
+            action: '/donate2/card?d=' + donationId + '&c=' + cid,
+            method: 'POST', timeout: 30,
+        });
+        if (c.card_prompt_file) gather.play(audioBase + c.card_prompt_file);
+        else gather.say('To donate ' + amount + ' dollars, please enter your credit card number using the keypad. Press the pound key when done.');
+        twiml.say("We didn't receive your card number.");
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[donate2/start]', e);
+        twiml.say('We are unable to process donations at this time.');
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Step 2: caller entered card number. Validate length, prompt for expiry.
+app.post('/donate2/card', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const cardDigits = (req.body.Digits || '').replace(/\D/g, '');
+        const donationId = req.query.d;
+        const cid = parseInt(req.query.c, 10);
+        const c = await getCampaign(cid);
+        if (!c) { twiml.say('Error.'); twiml.redirect('/webhook'); res.type('text/xml').send(twiml.toString()); return; }
+        if (cardDigits.length < 13 || cardDigits.length > 19) {
+            twiml.say('That card number does not appear valid.');
+            twiml.redirect('/donate2/start?c=' + cid);
+            res.type('text/xml').send(twiml.toString());
+            return;
+        }
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 4,
+            action: '/donate2/expiry?d=' + donationId + '&c=' + cid + '&card=' + cardDigits,
+            method: 'POST', timeout: 20, finishOnKey: '#',
+        });
+        if (c.expiry_prompt_file) gather.play(audioBase + c.expiry_prompt_file);
+        else gather.say('Please enter your card expiration date as four digits — two digits for the month, then two digits for the year.');
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[donate2/card]', e);
+        twiml.say('Error processing card.');
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Step 3: caller entered expiry. Prompt for CVV.
+app.post('/donate2/expiry', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const expDigits = (req.body.Digits || '').replace(/\D/g, '');
+        const card = req.query.card;
+        const donationId = req.query.d;
+        const cid = parseInt(req.query.c, 10);
+        const c = await getCampaign(cid);
+        if (!c) { twiml.say('Error.'); twiml.redirect('/webhook'); res.type('text/xml').send(twiml.toString()); return; }
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        if (expDigits.length !== 4) {
+            twiml.say('Expiration date should be four digits. Please try again.');
+            const g = twiml.gather({
+                input: 'dtmf', numDigits: 4,
+                action: '/donate2/expiry?d=' + donationId + '&c=' + cid + '&card=' + card,
+                method: 'POST', timeout: 20, finishOnKey: '#',
+            });
+            if (c.expiry_prompt_file) g.play(audioBase + c.expiry_prompt_file);
+            else g.say('Please enter your card expiration date as four digits — two digits for the month, then two digits for the year.');
+            twiml.redirect('/webhook');
+            res.type('text/xml').send(twiml.toString());
+            return;
+        }
+        const expM = expDigits.slice(0, 2);
+        const expY = expDigits.slice(2, 4);
+        const gather = twiml.gather({
+            input: 'dtmf', numDigits: 4,
+            action: '/donate2/process?d=' + donationId + '&c=' + cid + '&card=' + card + '&em=' + expM + '&ey=' + expY,
+            method: 'POST', timeout: 20, finishOnKey: '#',
+        });
+        if (c.cvv_prompt_file) gather.play(audioBase + c.cvv_prompt_file);
+        else gather.say('Please enter the three or four digit security code on the back of your card, then press the pound key.');
+        twiml.redirect('/webhook');
+    } catch (e) {
+        console.error('[donate2/expiry]', e);
+        twiml.say('Error.'); twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Step 4: caller entered CVV. Charge the card via USAePay, update the donation
+// row, then route to either the kvittel recording (if kvittel_enabled on the
+// campaign) or a thank-you-and-hangup.
+app.post('/donate2/process', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const cvv = (req.body.Digits || '').replace(/\D/g, '');
+        const card = req.query.card;
+        const expM = req.query.em;
+        const expY = req.query.ey;
+        const donationId = parseInt(req.query.d);
+        const cid = parseInt(req.query.c, 10);
+        const c = await getCampaign(cid);
+        if (!c) { twiml.say('Error.'); twiml.redirect('/webhook'); res.type('text/xml').send(twiml.toString()); return; }
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        const amount = (c.amount_cents || 0) / 100;
+        const last4 = String(card).slice(-4);
+
+        const result = await chargeUSAePay({
+            amount, cardNumber: card, expMonth: expM, expYear: expY, cvv,
+            description: c.name || 'IVR Donation',
+        });
+
+        await pool.query(
+            'UPDATE donations SET card_last4=$1, status=$2, transaction_id=$3, auth_code=$4, decline_reason=$5 WHERE id=$6',
+            [last4,
+             result.approved ? 'approved' : 'declined',
+             String(result.transactionId || ''),
+             String(result.authCode || ''),
+             result.approved ? null : (result.error || result.status || 'Declined'),
+             donationId]
+        );
+
+        if (result.approved) {
+            if (c.thank_you_file) twiml.play(audioBase + c.thank_you_file);
+            else twiml.say('Thank you. Your donation of ' + amount + ' dollars has been approved.');
+
+            if (c.kvittel_enabled) {
+                twiml.pause({ length: 1 });
+                if (c.kvittel_prompt_file) twiml.play(audioBase + c.kvittel_prompt_file);
+                else twiml.say('Please say one Hebrew name for your kvittel after the beep. Press the pound key when done.');
+                twiml.record({
+                    action: '/donate2/kvittel-saved?d=' + donationId + '&c=' + cid,
+                    method: 'POST', maxLength: 15, finishOnKey: '#',
+                    playBeep: true, trim: 'trim-silence',
+                });
+                twiml.say('Thank you. Goodbye.');
+                twiml.hangup();
+            } else {
+                twiml.pause({ length: 1 });
+                twiml.say('Thank you. Goodbye.');
+                twiml.hangup();
+            }
+        } else {
+            // Declined — offer retry instead of bouncing out
+            if (c.decline_file) twiml.play(audioBase + c.decline_file);
+            else twiml.say('We were unable to process your card. ' + (result.error || 'Please try again.'));
+            twiml.pause({ length: 1 });
+            const retryGather = twiml.gather({
+                numDigits: 1,
+                action: '/donate2/retry-choice?c=' + cid,
+                method: 'POST', timeout: 10,
+            });
+            retryGather.say('Press 1 to try again, or press 0 to return to the main menu.');
+            twiml.redirect('/webhook');
+        }
+    } catch (e) {
+        console.error('[donate2/process]', e);
+        twiml.say('We were unable to process your donation at this time.');
+        twiml.redirect('/webhook');
+    }
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Retry-or-quit choice after a decline
+app.post('/donate2/retry-choice', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    const cid = parseInt(req.query.c, 10);
+    const digit = req.body.Digits;
+    if (digit === '1') twiml.redirect('/donate2/start?c=' + cid);
+    else twiml.redirect('/webhook');
+    res.type('text/xml').send(twiml.toString());
+});
+
+// Kvittel recording completed — save the URL to the donation row, play the
+// kvittel-received thank-you, hang up.
+app.post('/donate2/kvittel-saved', async (req, res) => {
+    const twiml = new twilio.twiml.VoiceResponse();
+    try {
+        const donationId = parseInt(req.query.d);
+        const cid = parseInt(req.query.c, 10);
+        const recordingUrl = req.body.RecordingUrl;
+        if (recordingUrl && donationId) {
+            await pool.query('UPDATE donations SET kvittel_recording_url=$1 WHERE id=$2', [recordingUrl, donationId]);
+        }
+        const c = await getCampaign(cid);
+        const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
+        if (c?.kvittel_thank_file) twiml.play(audioBase + c.kvittel_thank_file);
+        else twiml.say('Thank you. Your kvittel has been received. May Hashem grant you all the brachos. Goodbye.');
+        twiml.hangup();
+    } catch (e) {
+        console.error('[donate2/kvittel-saved]', e);
         twiml.say('Thank you. Goodbye.');
         twiml.hangup();
     }
@@ -1529,6 +1924,153 @@ app.get('/api/donations/stats', async (req, res) => {
 app.delete('/api/donations/:id', async (req, res) => {
     try {
         await pool.query('DELETE FROM donations WHERE id=$1', [req.params.id]);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DONATION CAMPAIGNS — admin API (CRUD + per-campaign audio uploads)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// List all donation campaigns (active + inactive), sorted in display order.
+app.get('/api/donation-campaigns', async (req, res) => {
+    try {
+        const r = await pool.query(
+            'SELECT * FROM donation_campaigns ORDER BY sort_order ASC, id ASC'
+        );
+        res.json(r.rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get one campaign by id (used by admin edit form)
+app.get('/api/donation-campaigns/:id', async (req, res) => {
+    try {
+        const r = await pool.query('SELECT * FROM donation_campaigns WHERE id=$1', [req.params.id]);
+        if (!r.rows[0]) return res.status(404).json({ error: 'Not found' });
+        res.json(r.rows[0]);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Create or update a campaign (pass id to update, omit to insert).
+// Body fields: name, digit, amount_cents, description, kvittel_enabled, active, sort_order
+// (audio files are uploaded via a separate endpoint after the row exists)
+app.post('/api/donation-campaigns', async (req, res) => {
+    try {
+        const {
+            id, name, digit, amount_cents, description,
+            kvittel_enabled, active, sort_order,
+        } = req.body || {};
+        if (!name || !digit || amount_cents === undefined || amount_cents === null) {
+            return res.status(400).json({ error: 'name, digit, amount_cents required' });
+        }
+        const d = String(digit).replace(/\D/g, '').slice(0, 1);
+        if (!d) return res.status(400).json({ error: 'digit must be 0-9' });
+        const amt = parseInt(amount_cents, 10);
+        if (isNaN(amt) || amt <= 0) return res.status(400).json({ error: 'amount_cents must be a positive integer' });
+
+        // Validate: digit must be unique among ACTIVE campaigns (we let inactive
+        // ones share a digit so admin can stage replacements without losing config).
+        const isActive = active !== false && active !== 'false';
+        if (isActive) {
+            const dupArgs = id ? [d, id] : [d];
+            const dupSql = id
+                ? 'SELECT id FROM donation_campaigns WHERE digit=$1 AND active=TRUE AND id != $2'
+                : 'SELECT id FROM donation_campaigns WHERE digit=$1 AND active=TRUE';
+            const dup = await pool.query(dupSql, dupArgs);
+            if (dup.rows[0]) return res.status(400).json({ error: 'Another active campaign already uses digit ' + d });
+        }
+
+        if (id) {
+            const r = await pool.query(
+                `UPDATE donation_campaigns
+                 SET name=$1, digit=$2, amount_cents=$3, description=$4,
+                     kvittel_enabled=$5, active=$6, sort_order=$7, updated_at=NOW()
+                 WHERE id=$8 RETURNING *`,
+                [name, d, amt, description || null,
+                 !!kvittel_enabled, isActive, parseInt(sort_order, 10) || 0, id]
+            );
+            return res.json(r.rows[0]);
+        }
+        const r = await pool.query(
+            `INSERT INTO donation_campaigns
+              (name, digit, amount_cents, description, kvittel_enabled, active, sort_order)
+             VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+            [name, d, amt, description || null,
+             !!kvittel_enabled, isActive, parseInt(sort_order, 10) || 0]
+        );
+        res.json(r.rows[0]);
+    } catch (e) {
+        console.error('[POST /api/donation-campaigns]', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Delete a campaign
+app.delete('/api/donation-campaigns/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM donation_campaigns WHERE id=$1', [req.params.id]);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Reorder campaigns. Body: { order: [id1, id2, id3] } — sort_order assigned by index.
+app.post('/api/donation-campaigns/reorder', async (req, res) => {
+    try {
+        const order = Array.isArray(req.body?.order) ? req.body.order : [];
+        for (let i = 0; i < order.length; i++) {
+            await pool.query(
+                'UPDATE donation_campaigns SET sort_order=$1, updated_at=NOW() WHERE id=$2',
+                [i, order[i]]
+            );
+        }
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Upload one audio file for a campaign. Slot is one of:
+//   intro / card_prompt / expiry_prompt / cvv_prompt / thank_you /
+//   decline / kvittel_prompt / kvittel_thank
+// File is saved into the uploads dir (same shared dir as message audio); the
+// column gets the saved filename so /audio/<filename> serves it back.
+const DC_AUDIO_SLOTS = {
+    intro:          'intro_audio_file',
+    card_prompt:    'card_prompt_file',
+    expiry_prompt:  'expiry_prompt_file',
+    cvv_prompt:     'cvv_prompt_file',
+    thank_you:      'thank_you_file',
+    decline:        'decline_file',
+    kvittel_prompt: 'kvittel_prompt_file',
+    kvittel_thank:  'kvittel_thank_file',
+};
+
+app.post('/api/donation-campaigns/:id/audio/:slot', upload.single('audio'), async (req, res) => {
+    try {
+        const col = DC_AUDIO_SLOTS[req.params.slot];
+        if (!col) return res.status(400).json({ error: 'Invalid slot. Must be one of: ' + Object.keys(DC_AUDIO_SLOTS).join(', ') });
+        if (!req.file) return res.status(400).json({ error: 'No file uploaded (form field name must be "audio")' });
+        // multer's diskStorage saved it under req.file.filename in /uploads
+        const filename = req.file.filename;
+        const r = await pool.query(
+            `UPDATE donation_campaigns SET ${col} = $1, updated_at=NOW() WHERE id=$2 RETURNING *`,
+            [filename, req.params.id]
+        );
+        if (!r.rows[0]) return res.status(404).json({ error: 'Campaign not found' });
+        res.json({ ok: true, filename, campaign: r.rows[0] });
+    } catch (e) {
+        console.error('[POST /api/donation-campaigns/:id/audio]', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Clear (unset) an audio slot — the IVR will fall back to TTS for that prompt.
+app.delete('/api/donation-campaigns/:id/audio/:slot', async (req, res) => {
+    try {
+        const col = DC_AUDIO_SLOTS[req.params.slot];
+        if (!col) return res.status(400).json({ error: 'Invalid slot' });
+        await pool.query(
+            `UPDATE donation_campaigns SET ${col} = NULL, updated_at=NOW() WHERE id=$1`,
+            [req.params.id]
+        );
         res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2434,6 +2976,7 @@ body.embedded .container { padding-top: 8px; }
     <button class="nav-tab active" data-tab="add-message">📝 Add Message</button>
     <button class="nav-tab" data-tab="messages">📚 All Messages</button>
     <button class="nav-tab" data-tab="settings">⚙️ Menu Audio</button>
+    <button class="nav-tab" data-tab="donate-campaigns">💝 Donate Campaigns</button>
   </div>
 
   <div class="tab-content active" id="add-message">
@@ -3131,6 +3674,85 @@ body.embedded .container { padding-top: 8px; }
       </div>
     </div>
   </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       DONATE CAMPAIGNS TAB — manage multiple "press X to donate $Y to <cause>"
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="tab-content" id="donate-campaigns">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;flex-wrap:wrap;gap:.5rem;">
+        <h2 style="margin:0;">💝 Donate Campaigns</h2>
+        <button type="button" class="btn btn-primary" id="newCampaignBtn">+ New Campaign</button>
+      </div>
+      <div style="padding:.85rem 1rem;background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.3);border-radius:8px;margin-bottom:1.2rem;font-size:.85rem;line-height:1.55;color:#1E3A8A;">
+        Each campaign is one "press X to donate $Y to &lt;cause&gt;" option on the main menu.
+        The caller hears each active campaign's intro audio in sort order, then the digit they press
+        routes them through the card/expiry/CVV flow with that campaign's preset amount. If
+        <strong>Record kvittel</strong> is on, after approval the caller records a Hebrew name.
+        All payments go to the same USAePay merchant account.
+      </div>
+      <div id="campaigns-alert"></div>
+      <div id="campaignsList" style="display:flex;flex-direction:column;gap:.6rem;"></div>
+    </div>
+
+    <!-- ─── Edit/create modal ─── -->
+    <div id="campaignModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;align-items:center;justify-content:center;padding:1rem;">
+      <div style="background:var(--bg2);border-radius:var(--radius);max-width:680px;width:100%;max-height:92vh;overflow:auto;padding:1.4rem;box-shadow:var(--shadow);">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+          <h2 style="margin:0;" id="campaignModalTitle">New Campaign</h2>
+          <button type="button" class="btn btn-danger" onclick="closeCampaignModal()" style="padding:.4rem .7rem;">✕</button>
+        </div>
+        <form id="campaignForm">
+          <input type="hidden" id="campaignId" value="">
+          <div class="form-grid">
+            <div class="form-group">
+              <label for="campaignName">Name (internal label) *</label>
+              <input type="text" id="campaignName" placeholder="e.g. Nishmas $80 + kvittel" required>
+            </div>
+            <div class="form-group">
+              <label for="campaignDigit">Menu digit (0-9) *</label>
+              <input type="text" id="campaignDigit" maxlength="1" placeholder="8" required pattern="[0-9]">
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="form-group">
+              <label for="campaignAmount">Amount in dollars *</label>
+              <input type="number" id="campaignAmount" min="1" step="1" placeholder="80" required>
+            </div>
+            <div class="form-group">
+              <label for="campaignSortOrder">Sort order</label>
+              <input type="number" id="campaignSortOrder" step="1" value="0">
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="campaignDescription">Cause description (used only if no intro audio uploaded)</label>
+            <input type="text" id="campaignDescription" placeholder="e.g. XYZ Yeshiva — used in fallback TTS only">
+          </div>
+
+          <div style="margin:1rem 0;display:flex;gap:1.5rem;flex-wrap:wrap;">
+            <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:.92rem;">
+              <input type="checkbox" id="campaignActive" checked> Active (shown on main menu)
+            </label>
+            <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:.92rem;">
+              <input type="checkbox" id="campaignKvittel"> Record kvittel after approval
+            </label>
+          </div>
+
+          <button type="submit" class="btn btn-success btn-full">💾 Save Campaign Details</button>
+        </form>
+
+        <!-- Audio uploads (visible only after the campaign row exists) -->
+        <div id="campaignAudios" style="display:none;margin-top:1.5rem;">
+          <h3 style="margin-bottom:.8rem;font-size:1.05rem;">🎙️ Audio Files</h3>
+          <div style="font-size:.78rem;color:var(--text2);margin-bottom:.8rem;">
+            Upload an audio file for each prompt. If a slot is empty the IVR uses robot voice (TTS) for that prompt. The intro audio is what plays on the main menu — e.g. "To donate $80 to Nishmas, press 8."
+          </div>
+          <div id="campaignAudioSlots" style="display:flex;flex-direction:column;gap:.6rem;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -3816,6 +4438,231 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     else showAlert('settings-alert', 'Error saving', 'error');
   } catch (err) { showAlert('settings-alert', 'Error: ' + err.message, 'error'); }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DONATE CAMPAIGNS — admin tab logic
+// ═══════════════════════════════════════════════════════════════════════════
+
+// All audio slots a campaign can have, in display order.
+const DC_AUDIO_SLOT_LIST = [
+  { slot: 'intro',          col: 'intro_audio_file',     label: '📣 Main menu intro',    hint: 'Played on the main menu, e.g. "To donate $80 to XYZ press 8."' },
+  { slot: 'card_prompt',    col: 'card_prompt_file',     label: '💳 Card number prompt', hint: 'After they pressed the digit. Asks for credit card number.' },
+  { slot: 'expiry_prompt',  col: 'expiry_prompt_file',   label: '📅 Expiry date prompt', hint: 'Asks for 4 digit MM/YY expiration.' },
+  { slot: 'cvv_prompt',     col: 'cvv_prompt_file',      label: '🔢 CVV / security code prompt', hint: '"Please enter the three or four digit code on the back."' },
+  { slot: 'thank_you',      col: 'thank_you_file',       label: '🙏 Thank you (approved)', hint: 'Played after a successful charge.' },
+  { slot: 'decline',        col: 'decline_file',         label: '❌ Card declined message', hint: 'Played if the charge fails.' },
+  { slot: 'kvittel_prompt', col: 'kvittel_prompt_file',  label: '📝 Kvittel record prompt (only if Record kvittel is on)', hint: '"Please say one Hebrew name after the beep."' },
+  { slot: 'kvittel_thank',  col: 'kvittel_thank_file',   label: '✡️  Kvittel received thank you', hint: 'Played after the kvittel recording finishes.' },
+];
+
+let currentCampaigns = [];
+let editingCampaignId = null;
+
+async function loadCampaigns() {
+  try {
+    const r = await fetch('/api/donation-campaigns');
+    currentCampaigns = await r.json();
+    renderCampaignsList();
+  } catch (e) {
+    showAlert('campaigns-alert', 'Failed to load campaigns: ' + e.message, 'error');
+  }
+}
+
+function renderCampaignsList() {
+  const list = document.getElementById('campaignsList');
+  if (!currentCampaigns.length) {
+    list.innerHTML = '<div style="padding:1.4rem;text-align:center;color:var(--text2);background:var(--bg);border:1px dashed var(--border2);border-radius:8px;">No donation campaigns yet. Click <strong>+ New Campaign</strong> to create your first one.</div>';
+    return;
+  }
+  list.innerHTML = currentCampaigns.map(c => {
+    const dollars = ((c.amount_cents || 0) / 100).toFixed(0);
+    const audioFilled = DC_AUDIO_SLOT_LIST.filter(s => c[s.col]).length;
+    return '' +
+      '<div style="background:var(--bg);border:1px solid ' + (c.active ? 'var(--accent)' : 'var(--border)') + ';border-left:4px solid ' + (c.active ? 'var(--success)' : 'var(--text3)') + ';border-radius:8px;padding:.9rem 1rem;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:.6rem;flex-wrap:wrap;">' +
+          '<div style="flex:1;min-width:200px;">' +
+            '<div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;">' +
+              '<span style="font-weight:700;font-size:1.05rem;">' + esc(c.name) + '</span>' +
+              '<span style="padding:.2rem .55rem;background:var(--accent);color:#fff;border-radius:4px;font-size:.72rem;font-weight:700;">Press ' + esc(c.digit) + '</span>' +
+              '<span style="padding:.2rem .55rem;background:var(--success);color:#fff;border-radius:4px;font-size:.72rem;font-weight:700;">$' + dollars + '</span>' +
+              (c.kvittel_enabled ? '<span style="padding:.2rem .55rem;background:#7C3AED;color:#fff;border-radius:4px;font-size:.7rem;font-weight:700;">📝 KVITTEL</span>' : '') +
+              (!c.active ? '<span style="padding:.2rem .55rem;background:var(--text3);color:#fff;border-radius:4px;font-size:.7rem;font-weight:700;">INACTIVE</span>' : '') +
+            '</div>' +
+            (c.description ? '<div style="font-size:.78rem;color:var(--text2);margin-top:.35rem;">' + esc(c.description) + '</div>' : '') +
+            '<div style="font-size:.74rem;color:var(--text2);margin-top:.3rem;">' +
+              '🎙️ ' + audioFilled + ' / ' + DC_AUDIO_SLOT_LIST.length + ' audio files uploaded · sort #' + (c.sort_order || 0) +
+            '</div>' +
+          '</div>' +
+          '<div style="display:flex;gap:.3rem;">' +
+            '<button type="button" class="btn" onclick="editCampaign(' + c.id + ')" style="padding:.4rem .8rem;font-size:.8rem;">✏️ Edit</button>' +
+            '<button type="button" class="btn btn-danger" onclick="deleteCampaign(' + c.id + ')" style="padding:.4rem .7rem;font-size:.8rem;">🗑</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+  }).join('');
+}
+
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function openCampaignModal(camp) {
+  editingCampaignId = camp && camp.id ? camp.id : null;
+  document.getElementById('campaignModalTitle').textContent = camp && camp.id ? 'Edit Campaign' : 'New Campaign';
+  document.getElementById('campaignId').value          = camp && camp.id ? camp.id : '';
+  document.getElementById('campaignName').value        = camp && camp.name || '';
+  document.getElementById('campaignDigit').value       = camp && camp.digit || '';
+  document.getElementById('campaignAmount').value      = camp ? ((camp.amount_cents || 0) / 100) : '';
+  document.getElementById('campaignSortOrder').value   = camp && camp.sort_order != null ? camp.sort_order : 0;
+  document.getElementById('campaignDescription').value = camp && camp.description || '';
+  document.getElementById('campaignActive').checked    = camp ? camp.active !== false : true;
+  document.getElementById('campaignKvittel').checked   = !!(camp && camp.kvittel_enabled);
+  if (camp && camp.id) renderCampaignAudioSlots(camp);
+  else document.getElementById('campaignAudios').style.display = 'none';
+  document.getElementById('campaignModal').style.display = 'flex';
+}
+
+function closeCampaignModal() {
+  document.getElementById('campaignModal').style.display = 'none';
+  editingCampaignId = null;
+}
+
+function renderCampaignAudioSlots(camp) {
+  const wrap = document.getElementById('campaignAudios');
+  wrap.style.display = 'block';
+  const slots = document.getElementById('campaignAudioSlots');
+  slots.innerHTML = DC_AUDIO_SLOT_LIST.map(s => {
+    const current = camp[s.col];
+    const audioBase = '/audio/';
+    return '' +
+      '<div style="border:1px solid var(--border);border-radius:8px;padding:.8rem;background:var(--bg);">' +
+        '<div style="font-weight:600;font-size:.92rem;">' + s.label + '</div>' +
+        '<div style="font-size:.74rem;color:var(--text2);margin:.25rem 0 .6rem;">' + s.hint + '</div>' +
+        (current
+          ? '<div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin-bottom:.5rem;">' +
+              '<audio controls src="' + audioBase + esc(current) + '" style="height:32px;flex:1;min-width:200px;"></audio>' +
+              '<button type="button" class="btn btn-danger" onclick="clearCampaignAudio(' + camp.id + ',\\''+ s.slot +'\\')" style="padding:.3rem .6rem;font-size:.75rem;">🗑 Remove</button>' +
+            '</div>'
+          : '<div style="font-size:.78rem;color:var(--text3);margin-bottom:.5rem;font-style:italic;">No file — using robot voice (TTS) for this prompt.</div>'
+        ) +
+        '<input type="file" accept="audio/*" data-slot="' + s.slot + '" data-camp="' + camp.id + '" class="dc-audio-upload" style="font-size:.8rem;">' +
+      '</div>';
+  }).join('');
+  // Wire up file inputs
+  slots.querySelectorAll('.dc-audio-upload').forEach(inp => {
+    inp.addEventListener('change', async (e) => {
+      const f = inp.files && inp.files[0];
+      if (!f) return;
+      const slot = inp.getAttribute('data-slot');
+      const id   = inp.getAttribute('data-camp');
+      const fd = new FormData();
+      fd.append('audio', f);
+      try {
+        const r = await fetch('/api/donation-campaigns/' + id + '/audio/' + slot, {
+          method: 'POST', body: fd
+        });
+        const data = await r.json();
+        if (data.error) {
+          showAlert('campaigns-alert', 'Upload failed: ' + data.error, 'error');
+        } else {
+          showAlert('campaigns-alert', 'Audio uploaded', 'success');
+          // Re-render the modal with fresh state
+          await loadCampaigns();
+          const fresh = currentCampaigns.find(x => x.id == id);
+          if (fresh) renderCampaignAudioSlots(fresh);
+        }
+      } catch (err) {
+        showAlert('campaigns-alert', 'Upload error: ' + err.message, 'error');
+      }
+    });
+  });
+}
+
+async function clearCampaignAudio(id, slot) {
+  if (!confirm('Remove this audio file? The IVR will fall back to robot voice for this prompt.')) return;
+  try {
+    const r = await fetch('/api/donation-campaigns/' + id + '/audio/' + slot, { method: 'DELETE' });
+    const data = await r.json();
+    if (data.error) { showAlert('campaigns-alert', data.error, 'error'); return; }
+    await loadCampaigns();
+    const fresh = currentCampaigns.find(x => x.id == id);
+    if (fresh) renderCampaignAudioSlots(fresh);
+  } catch (e) {
+    showAlert('campaigns-alert', e.message, 'error');
+  }
+}
+
+async function editCampaign(id) {
+  const c = currentCampaigns.find(x => x.id === id);
+  if (!c) return;
+  openCampaignModal(c);
+}
+
+async function deleteCampaign(id) {
+  const c = currentCampaigns.find(x => x.id === id);
+  if (!c) return;
+  if (!confirm('Delete the campaign "' + c.name + '"? This also unsets digit ' + c.digit + ' on the main menu.')) return;
+  try {
+    await fetch('/api/donation-campaigns/' + id, { method: 'DELETE' });
+    await loadCampaigns();
+    showAlert('campaigns-alert', 'Campaign deleted', 'success');
+  } catch (e) {
+    showAlert('campaigns-alert', e.message, 'error');
+  }
+}
+
+// New-campaign button
+document.getElementById('newCampaignBtn').addEventListener('click', () => openCampaignModal(null));
+
+// Save (create or update) campaign details
+document.getElementById('campaignForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const id          = document.getElementById('campaignId').value;
+  const name        = document.getElementById('campaignName').value.trim();
+  const digit       = document.getElementById('campaignDigit').value.trim();
+  const amount      = parseFloat(document.getElementById('campaignAmount').value || '0');
+  const sortOrder   = parseInt(document.getElementById('campaignSortOrder').value || '0', 10);
+  const description = document.getElementById('campaignDescription').value.trim();
+  const active      = document.getElementById('campaignActive').checked;
+  const kvittel     = document.getElementById('campaignKvittel').checked;
+
+  if (!name || !digit || !amount || amount <= 0) {
+    showAlert('campaigns-alert', 'Name, digit, and a positive amount are required.', 'error');
+    return;
+  }
+
+  const body = {
+    name, digit,
+    amount_cents: Math.round(amount * 100),
+    description: description || null,
+    kvittel_enabled: kvittel,
+    active,
+    sort_order: sortOrder,
+  };
+  if (id) body.id = parseInt(id, 10);
+
+  try {
+    const r = await fetch('/api/donation-campaigns', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (data.error) { showAlert('campaigns-alert', data.error, 'error'); return; }
+    showAlert('campaigns-alert', id ? 'Campaign updated' : 'Campaign created', 'success');
+    await loadCampaigns();
+    // After create, switch into edit mode so audio uploads become available
+    const fresh = currentCampaigns.find(x => x.id === data.id);
+    if (fresh) openCampaignModal(fresh);
+  } catch (e) {
+    showAlert('campaigns-alert', e.message, 'error');
+  }
+});
+
+// Auto-load campaigns when the donate-campaigns tab is opened
+document.querySelectorAll('.nav-tab').forEach(t => {
+  t.addEventListener('click', () => {
+    if (t.getAttribute('data-tab') === 'donate-campaigns') loadCampaigns();
+  });
+});
+
 </script>
 </body>
 </html>`;
