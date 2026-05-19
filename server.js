@@ -1136,8 +1136,9 @@ app.post('/donate/process', async (req, res) => {
                 playBeep: true,
                 trim: 'trim-silence'
             });
-            twiml.say('Thank you. Goodbye.');
-            twiml.hangup();
+            // If recording times out / hits maxLength without a Twilio callback,
+            // bounce back to the main menu instead of hanging up.
+            twiml.redirect('/webhook');
         } else {
             // Declined — offer retry instead of bouncing to main menu
             if (s.donate_decline_file) twiml.play(audioBase + s.donate_decline_file);
@@ -1170,7 +1171,8 @@ app.post('/donate/retry-choice', async (req, res) => {
     res.type('text/xml').send(twiml.toString());
 });
 
-// Twilio sends the recorded kvittel here. Save the URL so admin can play it back.
+// Twilio sends the recorded kvittel here. Save the URL, play thank-you,
+// then bounce to the main menu so caller hears "Today is day X of Nishmas".
 app.post('/donate/kvittel-saved', async (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
     try {
@@ -1183,12 +1185,12 @@ app.post('/donate/kvittel-saved', async (req, res) => {
         const s = settingsRow.rows[0] || {};
         const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
         if (s.donate_kvittel_thank_file) twiml.play(audioBase + s.donate_kvittel_thank_file);
-        else twiml.say('Thank you. Your kvittel has been received. May Hashem grant you all the brachos. Goodbye.');
-        twiml.hangup();
+        else twiml.say('Thank you. Your kvittel has been received. May Hashem grant you all the brachos.');
+        twiml.pause({ length: 1 });
+        twiml.redirect('/webhook');
     } catch (e) {
         console.error('[donate/kvittel-saved]', e);
-        twiml.say('Thank you. Goodbye.');
-        twiml.hangup();
+        twiml.redirect('/webhook');
     }
     res.type('text/xml').send(twiml.toString());
 });
@@ -1380,12 +1382,14 @@ app.post('/donate2/process', async (req, res) => {
                     method: 'POST', maxLength: 15, finishOnKey: '#',
                     playBeep: true, trim: 'trim-silence',
                 });
-                twiml.say('Thank you. Goodbye.');
-                twiml.hangup();
+                // If recording times out / hits maxLength without a Twilio callback,
+                // bounce back to the main menu instead of hanging up.
+                twiml.redirect('/webhook');
             } else {
+                // No kvittel needed — bounce straight back to the main menu so the
+                // caller hears "Today is day X of Nishmas" + Press 1/2/3/etc again.
                 twiml.pause({ length: 1 });
-                twiml.say('Thank you. Goodbye.');
-                twiml.hangup();
+                twiml.redirect('/webhook');
             }
         } else {
             // Declined — offer retry instead of bouncing out
@@ -1419,7 +1423,8 @@ app.post('/donate2/retry-choice', async (req, res) => {
 });
 
 // Kvittel recording completed — save the URL to the donation row, play the
-// kvittel-received thank-you, hang up.
+// kvittel-received thank-you, then bounce back to the main menu so the caller
+// hears "Today is day X of Nishmas" + the regular Press 1/2/3/etc again.
 app.post('/donate2/kvittel-saved', async (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
     try {
@@ -1432,12 +1437,12 @@ app.post('/donate2/kvittel-saved', async (req, res) => {
         const c = await getCampaign(cid);
         const audioBase = req.protocol + '://' + req.get('host') + '/audio/';
         if (c?.kvittel_thank_file) twiml.play(audioBase + c.kvittel_thank_file);
-        else twiml.say('Thank you. Your kvittel has been received. May Hashem grant you all the brachos. Goodbye.');
-        twiml.hangup();
+        else twiml.say('Thank you. Your kvittel has been received. May Hashem grant you all the brachos.');
+        twiml.pause({ length: 1 });
+        twiml.redirect('/webhook');
     } catch (e) {
         console.error('[donate2/kvittel-saved]', e);
-        twiml.say('Thank you. Goodbye.');
-        twiml.hangup();
+        twiml.redirect('/webhook');
     }
     res.type('text/xml').send(twiml.toString());
 });
