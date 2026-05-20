@@ -2642,7 +2642,11 @@ app.post('/api/messages', upload.fields([
             if (speaker_name_audio) { query += ', speaker_name_audio = $' + p; params.push(speaker_name_audio); p++; }
             if (title_audio) { query += ', title_audio = $' + p; params.push(title_audio); p++; }
             if (dedication_audio) { query += ', dedication_audio_file = $' + p; params.push(dedication_audio); p++; }
-            if (audio_url !== undefined) { query += ', audio_url = $' + p; params.push(audio_url || null); p++; }
+            // Only update audio_url when a non-empty URL is provided. An empty
+            // value during an edit must NOT wipe the existing saved audio.
+            if (audio_url !== undefined && String(audio_url).trim() !== '') {
+              query += ', audio_url = $' + p; params.push(String(audio_url).trim()); p++;
+            }
             if (recorded_audio) { query += ', recorded_audio = $' + p; params.push(recorded_audio); p++; }
             query += ' WHERE day_number = $1';
             await pool.query(query, params);
@@ -4138,7 +4142,7 @@ function displayMessages() {
     return;
   }
   container.innerHTML = currentMessages.map(msg => {
-    const ready = !!(msg.recorded_audio && msg.speaker_name && msg.title);
+    const ready = !!((msg.recorded_audio || msg.audio_url) && msg.speaker_name && msg.title);
     const readyBadge = ready
       ? '<div style="display:inline-block;background:rgba(16,185,129,.15);color:#10b981;padding:.2rem .55rem;border-radius:6px;font-size:.7rem;font-weight:700;margin-left:.4rem;">✅ READY</div>'
       : '<div style="display:inline-block;background:rgba(245,158,11,.15);color:#f59e0b;padding:.2rem .55rem;border-radius:6px;font-size:.7rem;font-weight:700;margin-left:.4rem;">⚠️ INCOMPLETE</div>';
@@ -4167,8 +4171,8 @@ function displayMessages() {
       (msg.program_date ? '<div class="message-date" style="color:var(--gold,#d4a017);font-weight:600;">📅 ' + formatProgramDate(msg.program_date) + '</div>' : '') +
       (msg.allow_skip ? '<div style="display:inline-block;background:rgba(212,160,23,.15);color:#d4a017;font-size:.72rem;font-weight:700;padding:.15rem .5rem;border-radius:10px;margin:.3rem 0;">⏩ Skip enabled</div>' : '') +
       '<div class="message-date">Added: ' + new Date(msg.date_recorded).toLocaleDateString() + '</div>' +
-      (msg.recorded_audio ?
-        '<audio controls><source src="/audio/' + msg.recorded_audio + '"></audio>' :
+      (msg.recorded_audio || msg.audio_url ?
+        '<audio controls><source src="' + (msg.audio_url || ('/audio/' + msg.recorded_audio)) + '"></audio>' :
         '<p style="color:var(--warning);margin-top:.5rem;font-size:.8rem;">⚠️ No message audio</p>') +
       '<div class="message-actions">' +
         '<button class="btn btn-primary" data-day="' + msg.day_number + '" data-action="edit">Edit</button>' +
@@ -4228,6 +4232,25 @@ document.addEventListener('click', async (e) => {
       urlInput.value = '';
       document.getElementById('audioUrlPreview').style.display = 'none';
     }
+    // Show staff what audio is ALREADY saved so they don't think it was lost.
+    // (File-based audio can't pre-fill a file input, so we show a status banner.)
+    let banner = document.getElementById('editAudioStatus');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'editAudioStatus';
+      banner.style.cssText = 'background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.4);border-radius:8px;padding:.6rem .8rem;margin:.6rem 0;font-size:.82rem;color:#10b981;';
+      const form = document.getElementById('messageForm');
+      form.insertBefore(banner, form.firstChild);
+    }
+    const have = [];
+    const miss = [];
+    (m.recorded_audio || m.audio_url) ? have.push('message audio') : miss.push('message audio');
+    m.speaker_name_audio ? have.push('name audio') : miss.push('name audio');
+    m.title_audio ? have.push('title audio') : miss.push('title audio');
+    banner.innerHTML = '<strong>Editing Day ' + m.day_number + '.</strong> Already saved: ' +
+      (have.length ? '✓ ' + have.join(', ✓ ') : 'none') +
+      (miss.length ? ' &nbsp;|&nbsp; <span style="color:#f59e0b;">Missing: ' + miss.join(', ') + '</span>' : '') +
+      '<br><span style="color:var(--text2,#8b93a8);font-size:.76rem;">Leaving an upload box empty keeps the existing audio — it will NOT be erased. Only upload to replace.</span>';
     document.querySelector('.nav-tab[data-tab="add-message"]').click();
   } else if (action === 'delete') {
     const day = target.getAttribute('data-day');
@@ -4355,12 +4378,16 @@ document.getElementById('messageForm').addEventListener('submit', async (e) => {
       const saved = allMessages.find(m => m.day_number === dayNum);
       if (saved) {
         const savedTime = new Date().toLocaleTimeString();
-        showAlert('add-alert', '✅ Saved and verified in database at ' + savedTime + '. Day ' + dayNum + ' — ' + (saved.title || 'no title'), 'success');
+        const hasMsgAudio = !!(saved.recorded_audio || saved.audio_url);
+        const status = hasMsgAudio ? '✓ message audio attached' : '✗ NO message audio yet';
+        const tone = hasMsgAudio ? 'success' : 'error';
+        showAlert('add-alert', (hasMsgAudio ? '✅' : '⚠️') + ' Saved at ' + savedTime + ' — Day ' + dayNum + ' (' + (saved.title || 'no title') + '). ' + status + '.', tone);
       } else {
         showAlert('add-alert', '⚠️ Save appeared to succeed but could not be verified. Please check All Messages tab.', 'error');
       }
       document.getElementById('messageForm').reset();
       document.getElementById('audioUrlInput').value = '';
+      const eb = document.getElementById('editAudioStatus'); if (eb) eb.remove();
       document.getElementById('audioUrlPreview').style.display = 'none';
       document.querySelectorAll('.upload-area').forEach(a => a.classList.remove('has-file'));
       document.querySelectorAll('.recorded-preview').forEach(p => p.classList.remove('active'));
