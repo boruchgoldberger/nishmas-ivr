@@ -2683,6 +2683,43 @@ app.delete('/api/messages/:day', async (req, res) => {
     catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Change a message's day_number from the dashboard. The phone system plays
+// messages by day_number sequence, so this lets the admin reorder which message
+// plays on which day. If the target day is already occupied, the two messages
+// SWAP day numbers (so nothing is lost). Runs in a transaction.
+app.post('/api/messages/:day/change-day', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const fromDay = parseInt(req.params.day, 10);
+        const toDay = parseInt(req.body.new_day, 10);
+        if (!Number.isInteger(toDay) || toDay < 1 || toDay > 40) {
+            return res.status(400).json({ error: 'new_day must be a number between 1 and 40' });
+        }
+        if (fromDay === toDay) return res.json({ success: true, unchanged: true });
+
+        await client.query('BEGIN');
+        const src = (await client.query('SELECT id FROM nishmas_messages WHERE day_number=$1', [fromDay])).rows[0];
+        if (!src) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'No message on day ' + fromDay }); }
+        const dst = (await client.query('SELECT id FROM nishmas_messages WHERE day_number=$1', [toDay])).rows[0];
+
+        if (dst) {
+            // SWAP: move target to a temp day, source to target, target to source's old day
+            await client.query('UPDATE nishmas_messages SET day_number=$1 WHERE id=$2', [9999, dst.id]);
+            await client.query('UPDATE nishmas_messages SET day_number=$1 WHERE id=$2', [toDay, src.id]);
+            await client.query('UPDATE nishmas_messages SET day_number=$1 WHERE id=$2', [fromDay, dst.id]);
+            await client.query('COMMIT');
+            return res.json({ success: true, swapped: true, from: fromDay, to: toDay });
+        } else {
+            await client.query('UPDATE nishmas_messages SET day_number=$1 WHERE id=$2', [toDay, src.id]);
+            await client.query('COMMIT');
+            return res.json({ success: true, moved: true, from: fromDay, to: toDay });
+        }
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        res.status(500).json({ error: e.message });
+    } finally { client.release(); }
+});
+
 app.get('/api/settings', async (req, res) => {
     const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
     const currentDay = await getCurrentProgramDay();
@@ -4147,8 +4184,11 @@ function displayMessages() {
       ? '<div style="display:inline-block;background:rgba(16,185,129,.15);color:#10b981;padding:.2rem .55rem;border-radius:6px;font-size:.7rem;font-weight:700;margin-left:.4rem;">✅ READY</div>'
       : '<div style="display:inline-block;background:rgba(245,158,11,.15);color:#f59e0b;padding:.2rem .55rem;border-radius:6px;font-size:.7rem;font-weight:700;margin-left:.4rem;">⚠️ INCOMPLETE</div>';
     return '<div class="message-card">' +
-      '<div style="display:flex;align-items:center;flex-wrap:wrap;">' +
+      '<div style="display:flex;align-items:center;flex-wrap:wrap;gap:.4rem;">' +
         '<div class="day-badge">Day ' + msg.day_number + '</div>' +
+        '<button type="button" class="change-day-btn" data-day="' + msg.day_number + '" data-action="change-day" ' +
+          'style="background:none;border:1px solid var(--border,#2a2f3a);color:var(--text2,#8b93a8);font-size:.68rem;padding:.15rem .45rem;border-radius:6px;cursor:pointer;" ' +
+          'title="Change which day this message plays on">↔ change day</button>' +
         readyBadge +
       '</div>' +
       '<div class="speaker-info">' +
@@ -4252,6 +4292,35 @@ document.addEventListener('click', async (e) => {
       (miss.length ? ' &nbsp;|&nbsp; <span style="color:#f59e0b;">Missing: ' + miss.join(', ') + '</span>' : '') +
       '<br><span style="color:var(--text2,#8b93a8);font-size:.76rem;">Leaving an upload box empty keeps the existing audio — it will NOT be erased. Only upload to replace.</span>';
     document.querySelector('.nav-tab[data-tab="add-message"]').click();
+  } else if (action === 'change-day') {
+    const day = target.getAttribute('data-day');
+    const msg = currentMessages.find(x => x.day_number == day);
+    const title = (msg && msg.title) || 'this message';
+    const NL = String.fromCharCode(10);
+    const input = prompt('Change which DAY this message plays on.' + NL + NL +
+      'Currently: Day ' + day + ' — "' + title + '"' + NL + NL +
+      'Enter the new day number (1–40). If that day already has a message, the two will SWAP days.');
+    if (input === null) return;
+    const newDay = parseInt(input, 10);
+    if (!Number.isInteger(newDay) || newDay < 1 || newDay > 40) { alert('Please enter a number between 1 and 40.'); return; }
+    if (newDay == day) return;
+    try {
+      const r = await fetch('/api/messages/' + day + '/change-day', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ new_day: newDay }),
+      });
+      const result = await r.json().catch(() => ({}));
+      if (r.ok && result.success) {
+        showAlert('messagesAlert', result.swapped
+          ? '✅ Swapped: Day ' + day + ' ↔ Day ' + newDay
+          : '✅ Moved to Day ' + newDay, 'success');
+        await loadMessages();
+      } else {
+        showAlert('messagesAlert', '❌ ' + (result.error || 'Could not change day'), 'error');
+      }
+    } catch (err) {
+      showAlert('messagesAlert', '❌ Error: ' + err.message, 'error');
+    }
   } else if (action === 'delete') {
     const day = target.getAttribute('data-day');
     const msg = currentMessages.find(x => x.day_number == day);
