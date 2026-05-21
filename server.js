@@ -456,11 +456,58 @@ async function initDB() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DATE-DRIVEN MESSAGE SELECTION
+//
+// Source of truth = each message's `program_date` (the real calendar date
+// assigned in the admin builder, e.g. "2026-05-21"). The schedule already
+// skips Shabbos/Yom Tov (those dates simply have no message), so selecting
+// "the message whose program_date = today" is correct by construction — no
+// Hebcal needed and no drift.
+//
+// Previously these used a raw calendar count from program_start_date, which
+// did NOT skip Shabbos/YT and so drifted ahead — e.g. it reported day 19
+// (Glatstein, dated 2026-06-09) on 2026-05-21 when the correct message was
+// day 17 (Spero, dated 2026-05-21).
+//
+// "Today" is computed in America/New_York so day-rollover matches the
+// program's local day rather than the server's UTC day.
+// ---------------------------------------------------------------------------
+
+// Returns YYYY-MM-DD for "today" in America/New_York.
+function nishmasTodayET() {
+    const o = {};
+    for (const p of new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(new Date())) {
+        if (p.type !== 'literal') o[p.type] = p.value;
+    }
+    return `${o.year}-${o.month}-${o.day}`;
+}
+
 async function getCurrentProgramDay() {
     try {
+        const today = nishmasTodayET();
+        // Day number of the message scheduled for exactly today.
+        const t = await pool.query(
+            `SELECT day_number FROM nishmas_messages
+             WHERE program_date IS NOT NULL AND program_date::date = $1::date
+             ORDER BY day_number ASC LIMIT 1`, [today]
+        );
+        if (t.rows.length) return t.rows[0].day_number;
+
+        // No message dated today (Shabbos/YT/gap): report the most recent past
+        // dated message's day_number so "today is day N" still reads sensibly.
+        const prev = await pool.query(
+            `SELECT day_number FROM nishmas_messages
+             WHERE program_date IS NOT NULL AND program_date::date <= $1::date
+             ORDER BY program_date::date DESC, day_number DESC LIMIT 1`, [today]
+        );
+        if (prev.rows.length) return prev.rows[0].day_number;
+
+        // Legacy fallback: raw calendar count (only if no dated messages exist).
         const settings = await pool.query('SELECT program_start_date FROM nishmas_settings LIMIT 1');
         if (!settings.rows.length) return 1;
-        // Normalize to date-only (strip time) so partial-day clock differences don't shift the count
         const start = new Date(settings.rows[0].program_start_date);
         const startOfStart = new Date(start.getFullYear(), start.getMonth(), start.getDate());
         const now = new Date();
@@ -472,31 +519,53 @@ async function getCurrentProgramDay() {
 
 async function getMostRecentMessage() {
     try {
+        const today = nishmasTodayET();
+        const m = await pool.query(
+            `SELECT * FROM nishmas_messages
+             WHERE is_active = true AND program_date IS NOT NULL AND program_date::date <= $1::date
+             ORDER BY program_date::date DESC, day_number DESC LIMIT 1`, [today]
+        );
+        if (m.rows.length) return m.rows[0];
+        // Legacy fallback by day_number if no dated messages.
         const currentDay = await getCurrentProgramDay();
         for (let day = currentDay; day >= 1; day--) {
-            const m = await pool.query('SELECT * FROM nishmas_messages WHERE day_number = $1 AND is_active = true', [day]);
-            if (m.rows.length) return m.rows[0];
+            const r = await pool.query('SELECT * FROM nishmas_messages WHERE day_number = $1 AND is_active = true', [day]);
+            if (r.rows.length) return r.rows[0];
         }
         return null;
     } catch { return null; }
 }
 
-// Today's message = message for exactly today's day_number. Returns null on skip days (no upload for this day).
+// Today's message = the active message whose program_date is exactly today.
+// Returns null on Shabbos/YT/gap days (no message dated today) → caller plays
+// the "no new message today" branch, which is the desired behavior.
 async function getTodaysMessage() {
     try {
-        const currentDay = await getCurrentProgramDay();
-        const m = await pool.query('SELECT * FROM nishmas_messages WHERE day_number = $1 AND is_active = true', [currentDay]);
+        const today = nishmasTodayET();
+        const m = await pool.query(
+            `SELECT * FROM nishmas_messages
+             WHERE is_active = true AND program_date IS NOT NULL AND program_date::date = $1::date
+             ORDER BY day_number ASC LIMIT 1`, [today]
+        );
         return m.rows[0] || null;
     } catch { return null; }
 }
 
-// Yesterday's message = most recent active message with day_number < today. Skips gaps automatically.
+// Yesterday's message = most recent active message dated strictly before today.
 async function getYesterdaysMessage() {
     try {
+        const today = nishmasTodayET();
+        const m = await pool.query(
+            `SELECT * FROM nishmas_messages
+             WHERE is_active = true AND program_date IS NOT NULL AND program_date::date < $1::date
+             ORDER BY program_date::date DESC, day_number DESC LIMIT 1`, [today]
+        );
+        if (m.rows.length) return m.rows[0];
+        // Legacy fallback by day_number.
         const currentDay = await getCurrentProgramDay();
         for (let day = currentDay - 1; day >= 1; day--) {
-            const m = await pool.query('SELECT * FROM nishmas_messages WHERE day_number = $1 AND is_active = true', [day]);
-            if (m.rows.length) return m.rows[0];
+            const r = await pool.query('SELECT * FROM nishmas_messages WHERE day_number = $1 AND is_active = true', [day]);
+            if (r.rows.length) return r.rows[0];
         }
         return null;
     } catch { return null; }
@@ -2720,6 +2789,138 @@ app.post('/api/messages/:day/change-day', async (req, res) => {
     } finally { client.release(); }
 });
 
+// ===========================================================================
+// SYNC FROM NISHMAS BUILDER
+//
+// The Nishmas Builder (bgold backend) is the editorial source of truth for the
+// 40-day schedule: it knows each day's real DATE (skipping Shabbos/Yom Tov),
+// the SPEAKER, and the TITLE. The IVR only adds AUDIO.
+//
+// This pulls the Builder's schedule and aligns the IVR's nishmas_messages to it
+// MATCHED BY DATE (program_date ↔ send_date), so day numbers follow the Builder
+// and the phone plays the right message on the right day. It NEVER touches audio
+// fields — only day_number, program_date, speaker_name, title, is_skip_day.
+//
+// Two steps: /preview (no writes, returns the plan) and /apply (backup + txn).
+// ===========================================================================
+const BUILDER_API = process.env.BUILDER_API || 'https://go.ohelsarala.link';
+
+// Fetch + normalize the Builder's 40 days. send_date → YYYY-MM-DD in ET.
+async function fetchBuilderDays() {
+    const r = await fetch(BUILDER_API + '/api/nishmas/days');
+    if (!r.ok) throw new Error('Builder API returned ' + r.status);
+    const rows = await r.json();
+    if (!Array.isArray(rows)) throw new Error('Builder API did not return a list');
+    const toETDate = (sd) => {
+        if (!sd) return null;
+        // send_date is an instant (midnight ET stored as 04:00Z). Render the ET date.
+        const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' })
+            .formatToParts(new Date(sd));
+        const o = {}; for (const p of parts) if (p.type !== 'literal') o[p.type] = p.value;
+        return `${o.year}-${o.month}-${o.day}`;
+    };
+    return rows.map(d => ({
+        day_number: parseInt(d.day_number, 10),
+        date: toETDate(d.send_date),
+        speaker: d.speaker || null,
+        title: d.video_title || null,
+        is_skip_day: !!d.is_skip_day,
+        skip_reason: d.skip_reason || null,
+    })).filter(d => Number.isInteger(d.day_number) && d.date);
+}
+
+// Build the alignment plan: match IVR messages to Builder days BY DATE.
+async function buildSyncPlan() {
+    const builder = await fetchBuilderDays();
+    const ivr = (await pool.query('SELECT id, day_number, program_date, speaker_name, title, is_skip_day, recorded_audio, audio_url, speaker_name_audio, title_audio FROM nishmas_messages')).rows;
+    const ivrByDate = new Map();
+    for (const m of ivr) {
+        const d = m.program_date ? String(m.program_date).split('T')[0].slice(0, 10) : null;
+        if (d) ivrByDate.set(d, m);
+    }
+    const hasAudio = (m) => !!(m && (m.recorded_audio || m.audio_url));
+    const plan = [];
+    for (const b of builder) {
+        const match = ivrByDate.get(b.date) || null;
+        let action;
+        if (!match) action = b.is_skip_day ? 'create_skip' : 'create_empty';
+        else {
+            const numChanges = match.day_number !== b.day_number;
+            const textChanges = (match.speaker_name || null) !== b.speaker || (match.title || null) !== b.title || !!match.is_skip_day !== b.is_skip_day;
+            action = (numChanges || textChanges) ? 'update' : 'unchanged';
+        }
+        plan.push({
+            builder_day: b.day_number, date: b.date, speaker: b.speaker, title: b.title,
+            is_skip_day: b.is_skip_day, skip_reason: b.skip_reason,
+            ivr_id: match ? match.id : null,
+            ivr_current_day: match ? match.day_number : null,
+            ivr_has_audio: hasAudio(match),
+            action,
+        });
+    }
+    // IVR messages whose date is NOT in the Builder schedule — flagged, never auto-deleted.
+    const builderDates = new Set(builder.map(b => b.date));
+    const orphans = ivr
+        .filter(m => { const d = m.program_date ? String(m.program_date).split('T')[0].slice(0, 10) : null; return !d || !builderDates.has(d); })
+        .map(m => ({ ivr_id: m.id, ivr_day: m.day_number, date: m.program_date ? String(m.program_date).split('T')[0].slice(0, 10) : null, speaker: m.speaker_name, title: m.title, ivr_has_audio: hasAudio(m) }));
+    return { plan, orphans, builder_count: builder.length, ivr_count: ivr.length };
+}
+
+// PREVIEW — no writes.
+app.get('/api/sync-from-builder/preview', async (req, res) => {
+    try {
+        const result = await buildSyncPlan();
+        res.json({ ok: true, ...result });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// APPLY — backup table, then apply plan in a transaction.
+// Renumber is collision-safe: first shift every touched row to a temp range
+// (+10000), then assign final Builder day_numbers.
+app.post('/api/sync-from-builder/apply', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { plan } = await buildSyncPlan();
+
+        await client.query('BEGIN');
+        // Backup: snapshot current messages into a timestamped table (text-only is fine; audio filenames preserved).
+        const backupName = 'nishmas_messages_backup_' + new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+        await client.query(`CREATE TABLE ${backupName} AS TABLE nishmas_messages`);
+
+        // Phase 1: move every existing row that will change number into a temp range to avoid UNIQUE collisions.
+        const toRenumber = plan.filter(p => p.ivr_id && p.ivr_current_day !== p.builder_day);
+        for (const p of toRenumber) {
+            await client.query('UPDATE nishmas_messages SET day_number = $1 WHERE id = $2', [p.builder_day + 10000, p.ivr_id]);
+        }
+        // Phase 2: apply final state per Builder day.
+        let created = 0, updated = 0, renumbered = 0;
+        for (const p of plan) {
+            if (p.action === 'create_empty' || p.action === 'create_skip') {
+                await client.query(
+                    `INSERT INTO nishmas_messages (day_number, title, speaker_name, program_date, is_skip_day, date_recorded)
+                     VALUES ($1,$2,$3,$4,$5,NOW())
+                     ON CONFLICT (day_number) DO NOTHING`,
+                    [p.builder_day, p.title || (p.is_skip_day ? (p.skip_reason || 'Shabbos / Yom Tov') : ''), p.speaker || '', p.date, p.is_skip_day]);
+                created++;
+            } else if (p.action === 'update' || p.action === 'unchanged') {
+                // Update text/date/skip/number. NEVER touch audio columns.
+                await client.query(
+                    `UPDATE nishmas_messages
+                       SET day_number = $1, program_date = $2, speaker_name = $3, title = $4, is_skip_day = $5
+                     WHERE id = $6`,
+                    [p.builder_day, p.date, p.speaker || '', p.title || (p.is_skip_day ? (p.skip_reason || 'Shabbos / Yom Tov') : ''), p.is_skip_day, p.ivr_id]);
+                if (p.ivr_current_day !== p.builder_day) renumbered++;
+                else updated++;
+            }
+        }
+        await client.query('COMMIT');
+        res.json({ ok: true, backup_table: backupName, created, updated, renumbered });
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        res.status(500).json({ error: e.message });
+    } finally { client.release(); }
+});
+
 app.get('/api/settings', async (req, res) => {
     const settings = await pool.query('SELECT * FROM nishmas_settings LIMIT 1');
     const currentDay = await getCurrentProgramDay();
@@ -3032,8 +3233,9 @@ body.embedded .container { padding-top: 8px; }
       <form id="messageForm" enctype="multipart/form-data">
         <div class="form-grid">
           <div class="form-group">
-            <label for="dayNumber">Day Number</label>
-            <input type="number" id="dayNumber" min="1" max="40" required>
+            <label for="dayNumber">Day Number <span style="font-weight:400;font-size:.78rem;color:var(--text2)">(auto — set by the date below)</span></label>
+            <input type="number" id="dayNumber" min="1" max="40" required readonly
+              style="background:var(--bg3,#0d1017);cursor:not-allowed;opacity:.85;">
           </div>
           <div class="form-group">
             <label for="speakerName">Speaker Name</label>
@@ -3067,8 +3269,15 @@ body.embedded .container { padding-top: 8px; }
           </div>
         </div>
         <div class="form-group">
-          <label for="programDate">Program Date (for your reference)</label>
-          <input type="date" id="programDate">
+          <label for="programDate" style="font-weight:700;color:#d4a017;">📅 Program Date <span style="font-weight:400;font-size:.78rem;color:var(--text2)">— the day this plays on the phone line</span></label>
+          <div style="display:flex;align-items:center;gap:.6rem;">
+            <input type="date" id="programDate" required style="flex:1;">
+            <button type="button" id="editDateBtn" onclick="unlockProgramDate()"
+              style="display:none;padding:.45rem .7rem;font-size:.78rem;background:var(--bg2,#111318);border:1px solid var(--border,#1e2230);border-radius:6px;color:#d4a017;cursor:pointer;white-space:nowrap;">✏️ change date</button>
+          </div>
+          <div id="programDateHint" style="font-size:.78rem;color:var(--text2,#8b93a8);margin-top:.3rem;">
+            Pick the date — the day number is set automatically. Dates skip Shabbos; double-check around Yom&nbsp;Tov.
+          </div>
           <div style="margin-top:1rem;display:flex;align-items:center;gap:.75rem;background:var(--bg2,#111318);border:1px solid var(--border,#1e2230);border-radius:8px;padding:.75rem 1rem;">
             <input type="checkbox" id="allowSkip" style="width:18px;height:18px;cursor:pointer;accent-color:#d4a017;">
             <div>
@@ -3158,9 +3367,31 @@ body.embedded .container { padding-top: 8px; }
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;margin-bottom:1rem;">
         <h2 style="margin:0;">All Messages</h2>
-        <div id="messagesStatusSummary" style="font-size:.9rem;color:var(--text-light);"></div>
+        <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;">
+          <div id="messagesStatusSummary" style="font-size:.9rem;color:var(--text-light);"></div>
+          <button type="button" onclick="openSyncPreview()"
+            style="padding:.5rem .9rem;font-size:.85rem;font-weight:600;background:#d4a017;color:#1a1a1a;border:none;border-radius:8px;cursor:pointer;white-space:nowrap;">🔄 Sync from Builder</button>
+        </div>
       </div>
       <div id="messagesAlert"></div>
+      <!-- Sync-from-Builder preview modal -->
+      <div id="syncModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;align-items:flex-start;justify-content:center;overflow:auto;padding:2rem 1rem;">
+        <div style="background:var(--bg,#fff);border-radius:12px;max-width:820px;width:100%;padding:1.5rem;box-shadow:0 20px 60px rgba(0,0,0,.4);">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.5rem;">
+            <h3 style="margin:0;color:#d4a017;">🔄 Sync from Nishmas Builder</h3>
+            <button type="button" onclick="closeSyncPreview()" style="background:none;border:none;font-size:1.4rem;cursor:pointer;color:var(--text2,#888);">×</button>
+          </div>
+          <p style="font-size:.85rem;color:var(--text2,#888);margin:.25rem 0 1rem;">
+            Pulls each day's <strong>date, speaker, and title</strong> from the Builder and lines the phone messages up to match (matched by date). Your <strong>audio is never touched</strong>. Review below, then apply.
+          </p>
+          <div id="syncPreviewBody" style="font-size:.85rem;max-height:55vh;overflow:auto;">Loading preview…</div>
+          <div style="display:flex;gap:.75rem;justify-content:flex-end;margin-top:1rem;">
+            <button type="button" onclick="closeSyncPreview()" style="padding:.55rem 1rem;border:1px solid var(--border,#ccc);background:var(--bg2,#f5f5f5);border-radius:8px;cursor:pointer;">Cancel</button>
+            <button type="button" id="syncApplyBtn" onclick="applySync()" disabled
+              style="padding:.55rem 1.1rem;border:none;background:#d4a017;color:#1a1a1a;font-weight:700;border-radius:8px;cursor:pointer;opacity:.6;">Apply changes</button>
+          </div>
+        </div>
+      </div>
       <div class="messages-grid" id="messagesContainer">
         <div class="empty-state"><div class="empty-state-icon">⏳</div><p>Loading...</p></div>
       </div>
@@ -3808,6 +4039,80 @@ let mediaRecorder = null;
 let recordedChunks = [];
 let recordedObjectUrls = {}; // track object URLs to revoke
 
+// ===== DATE-ANCHORED DAY ENTRY =====
+// The Program Date is the anchor the secretary works with; the day number is
+// derived automatically. This prevents the "wrong day plays" confusion: a
+// recording placed on a date plays on that date (the IVR selects by date).
+//
+// pad2 / ymd helpers operate on local date parts (no UTC shift).
+function _pad2(n){ return String(n).padStart(2,'0'); }
+function _ymd(d){ return d.getFullYear()+'-'+_pad2(d.getMonth()+1)+'-'+_pad2(d.getDate()); }
+
+// Suggest the next program date = latest existing program_date + 1 day,
+// skipping Saturday (weekly Shabbos). Does NOT know Yom Tov — the hint tells
+// the secretary to double-check around holidays. Returns 'YYYY-MM-DD' or ''.
+function suggestNextProgramDate(){
+  const dates = (currentMessages||[])
+    .map(m => m.program_date ? String(m.program_date).split('T')[0].slice(0,10) : '')
+    .filter(Boolean)
+    .sort();
+  if (!dates.length) return '';
+  const last = dates[dates.length-1];
+  const parts = last.split('-').map(Number);
+  const d = new Date(parts[0], parts[1]-1, parts[2]);
+  d.setDate(d.getDate()+1);
+  if (d.getDay() === 6) d.setDate(d.getDate()+1); // skip Saturday (Shabbos)
+  return _ymd(d);
+}
+
+// Given a program date, find which day_number it should be. If a message
+// already exists on that date, reuse its number; otherwise it's the next
+// number after the latest dated message (so dates and numbers stay in order).
+function deriveDayNumberForDate(dateStr){
+  if (!dateStr) return '';
+  const exact = (currentMessages||[]).find(m =>
+    m.program_date && String(m.program_date).split('T')[0].slice(0,10) === dateStr);
+  if (exact) return exact.day_number;
+  // Count dated messages strictly before this date; new number = that + 1,
+  // but never below (max existing day_number that is on/after) ... keep simple:
+  const dated = (currentMessages||[])
+    .filter(m => m.program_date)
+    .map(m => ({ n: Number(m.day_number), d: String(m.program_date).split('T')[0].slice(0,10) }))
+    .sort((a,b) => a.d.localeCompare(b.d));
+  let n = 1;
+  for (const row of dated){ if (row.d < dateStr) n = row.n + 1; }
+  return n;
+}
+
+// When the date changes, auto-fill the day number field.
+function onProgramDateChange(){
+  const dateStr = document.getElementById('programDate').value;
+  const dn = deriveDayNumberForDate(dateStr);
+  if (dn) document.getElementById('dayNumber').value = dn;
+}
+
+// Lock the date field (default for existing days) and show the "change date" link.
+function lockProgramDate(){
+  const inp = document.getElementById('programDate');
+  const btn = document.getElementById('editDateBtn');
+  if (inp){ inp.readOnly = true; inp.style.background = 'var(--bg3,#0d1017)'; inp.style.cursor = 'not-allowed'; inp.style.opacity = '.85'; }
+  if (btn) btn.style.display = 'inline-block';
+}
+// Unlock for a deliberate correction.
+function unlockProgramDate(){
+  const inp = document.getElementById('programDate');
+  const btn = document.getElementById('editDateBtn');
+  if (inp){ inp.readOnly = false; inp.style.background = ''; inp.style.cursor = ''; inp.style.opacity = ''; inp.focus(); }
+  if (btn) btn.style.display = 'none';
+}
+// Editable date (default for a brand-new day being added).
+function unlockProgramDateForNew(){
+  const inp = document.getElementById('programDate');
+  const btn = document.getElementById('editDateBtn');
+  if (inp){ inp.readOnly = false; inp.style.background = ''; inp.style.cursor = ''; inp.style.opacity = ''; }
+  if (btn) btn.style.display = 'none';
+}
+
 // ===== TAB SWITCHING =====
 document.querySelectorAll('.nav-tab').forEach(tab => {
   tab.addEventListener('click', () => {
@@ -3917,6 +4222,11 @@ document.querySelectorAll('.upload-area').forEach(area => {
 document.addEventListener('DOMContentLoaded', () => {
   loadMessages();
   loadSettings();
+  const pd = document.getElementById('programDate');
+  if (pd) {
+    pd.addEventListener('change', onProgramDateChange);
+    pd.addEventListener('input', onProgramDateChange);
+  }
 });
 
 async function loadMessages() {
@@ -3924,7 +4234,95 @@ async function loadMessages() {
     const r = await fetch('/api/messages');
     currentMessages = await r.json();
     displayMessages();
+    // If the form isn't currently mid-edit (date not locked) and is empty,
+    // pre-fill the suggested next date so a new entry is ready to go.
+    const pd = document.getElementById('programDate');
+    if (pd && !pd.readOnly && !pd.value) {
+      const sug = suggestNextProgramDate();
+      if (sug){ pd.value = sug; onProgramDateChange(); }
+    }
   } catch (e) { console.error(e); }
+}
+
+// ===== SYNC FROM BUILDER =====
+function openSyncPreview() {
+  document.getElementById('syncModal').style.display = 'flex';
+  document.getElementById('syncApplyBtn').disabled = true;
+  document.getElementById('syncApplyBtn').style.opacity = '.6';
+  const body = document.getElementById('syncPreviewBody');
+  body.innerHTML = 'Loading preview from the Builder…';
+  fetch('/api/sync-from-builder/preview')
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { body.innerHTML = '<div style="color:#c00;">Error: ' + data.error + '</div>'; return; }
+      const esc = (s) => String(s == null ? '' : s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+      const actionLabel = {
+        create_empty: '🆕 new empty box',
+        create_skip:  '🆕 skip day',
+        update:       '✏️ update',
+        unchanged:    '✓ no change',
+      };
+      let changes = 0, renumbers = 0, creates = 0;
+      let rows = '';
+      for (const p of data.plan) {
+        if (p.action !== 'unchanged') changes++;
+        if (p.action.startsWith('create')) creates++;
+        const renum = (p.ivr_current_day != null && p.ivr_current_day !== p.builder_day);
+        if (renum) renumbers++;
+        const numCell = renum
+          ? '<span style="color:#b45309;font-weight:700;">' + p.ivr_current_day + ' → ' + p.builder_day + '</span>'
+          : ('Day ' + p.builder_day);
+        const audioWarn = (renum && p.ivr_has_audio) ? ' <span title="has audio, will move with it">🎵</span>' : '';
+        rows += '<tr style="border-bottom:1px solid var(--border,#eee);">'
+          + '<td style="padding:.35rem .5rem;white-space:nowrap;">' + numCell + audioWarn + '</td>'
+          + '<td style="padding:.35rem .5rem;white-space:nowrap;">' + esc(p.date) + '</td>'
+          + '<td style="padding:.35rem .5rem;">' + (p.is_skip_day ? '<em style="color:#888;">' + esc(p.skip_reason || 'Shabbos/Yom Tov') + '</em>' : esc(p.speaker)) + '</td>'
+          + '<td style="padding:.35rem .5rem;">' + (p.is_skip_day ? '—' : esc(p.title)) + '</td>'
+          + '<td style="padding:.35rem .5rem;white-space:nowrap;font-size:.78rem;">' + (actionLabel[p.action] || p.action) + '</td>'
+          + '</tr>';
+      }
+      let orphanHtml = '';
+      if (data.orphans && data.orphans.length) {
+        orphanHtml = '<div style="margin-top:1rem;padding:.75rem;background:rgba(217,119,6,.08);border:1px solid #d4a017;border-radius:8px;">'
+          + '<strong>⚠️ ' + data.orphans.length + ' phone message(s) have a date NOT in the Builder schedule.</strong> '
+          + 'These are left untouched (not deleted): '
+          + data.orphans.map(o => esc((o.title || 'Day ' + o.ivr_day)) + (o.date ? ' (' + esc(o.date) + ')' : '') + (o.ivr_has_audio ? ' 🎵' : '')).join('; ')
+          + '</div>';
+      }
+      body.innerHTML =
+        '<div style="margin-bottom:.6rem;font-weight:600;">'
+        + data.builder_count + ' Builder days · ' + changes + ' change(s): ' + creates + ' new, ' + renumbers + ' renumbered.'
+        + '</div>'
+        + '<table style="width:100%;border-collapse:collapse;">'
+        + '<thead><tr style="text-align:left;border-bottom:2px solid var(--border,#ddd);font-size:.78rem;text-transform:uppercase;color:var(--text2,#888);">'
+        + '<th style="padding:.35rem .5rem;">Day</th><th style="padding:.35rem .5rem;">Date</th><th style="padding:.35rem .5rem;">Speaker</th><th style="padding:.35rem .5rem;">Title</th><th style="padding:.35rem .5rem;">Action</th>'
+        + '</tr></thead><tbody>' + rows + '</tbody></table>'
+        + orphanHtml;
+      const btn = document.getElementById('syncApplyBtn');
+      btn.disabled = false; btn.style.opacity = '1';
+      btn.textContent = changes ? ('Apply ' + changes + ' change(s)') : 'Nothing to change';
+      if (!changes) { btn.disabled = true; btn.style.opacity = '.6'; }
+    })
+    .catch(e => { body.innerHTML = '<div style="color:#c00;">Failed to load preview: ' + e.message + '</div>'; });
+}
+
+function closeSyncPreview() { document.getElementById('syncModal').style.display = 'none'; }
+
+async function applySync() {
+  const btn = document.getElementById('syncApplyBtn');
+  btn.disabled = true; btn.style.opacity = '.6'; btn.textContent = 'Applying…';
+  try {
+    const r = await fetch('/api/sync-from-builder/apply', { method: 'POST' });
+    const d = await r.json();
+    if (d.error) { showAlert('messagesAlert', '❌ Sync failed: ' + d.error, 'error'); btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'Retry'; return; }
+    closeSyncPreview();
+    showAlert('messagesAlert', '✅ Synced from Builder — ' + d.created + ' created, ' + d.renumbered + ' renumbered, ' + d.updated + ' updated. Backup saved as ' + d.backup_table + '.', 'success');
+    loadMessages();
+    loadSettings();
+  } catch (e) {
+    showAlert('messagesAlert', '❌ Sync error: ' + e.message, 'error');
+    btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'Retry';
+  }
 }
 
 async function loadSettings() {
@@ -4262,6 +4660,8 @@ document.addEventListener('click', async (e) => {
     document.getElementById('speakerName').value = m.speaker_name || '';
     document.getElementById('messageTitle').value = m.title;
     document.getElementById('programDate').value = m.program_date ? String(m.program_date).split('T')[0].slice(0,10) : '';
+    onProgramDateChange();
+    lockProgramDate(); // existing day → date is locked; secretary uses "✏️ change date" to override
     document.getElementById('allowSkip').checked = !!m.allow_skip;
     const urlInput = document.getElementById('audioUrlInput');
     if (m.audio_url) {
@@ -4460,7 +4860,11 @@ document.getElementById('messageForm').addEventListener('submit', async (e) => {
       document.getElementById('audioUrlPreview').style.display = 'none';
       document.querySelectorAll('.upload-area').forEach(a => a.classList.remove('has-file'));
       document.querySelectorAll('.recorded-preview').forEach(p => p.classList.remove('active'));
-      loadMessages();
+      await loadMessages();
+      // Prep the form for the NEXT new day: editable date, auto-suggested.
+      unlockProgramDateForNew();
+      const sug = suggestNextProgramDate();
+      if (sug){ document.getElementById('programDate').value = sug; onProgramDateChange(); }
     } else {
       showAlert('add-alert', '❌ Error saving — the server rejected the request', 'error');
     }
