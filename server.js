@@ -2683,8 +2683,13 @@ app.post('/api/upload-chunk', upload.single('chunk'), async (req, res) => {
 });
 
 app.get('/api/messages', async (req, res) => {
-    const messages = await pool.query('SELECT * FROM nishmas_messages ORDER BY day_number ASC');
-    res.json(messages.rows);
+    try {
+        const messages = await pool.query('SELECT * FROM nishmas_messages ORDER BY day_number ASC');
+        res.json(messages.rows);
+    } catch (e) {
+        console.error('[GET /api/messages]', e.message);
+        res.status(500).json({ error: e.message });
+    }
 });
 
 app.post('/api/messages', upload.fields([
@@ -4232,7 +4237,16 @@ document.addEventListener('DOMContentLoaded', () => {
 async function loadMessages() {
   try {
     const r = await fetch('/api/messages');
-    currentMessages = await r.json();
+    const data = await r.json();
+    // Guard: the endpoint should return an array, but on an error it could
+    // return {error:...}. Coerce to an array so displayMessages() (which calls
+    // .filter/.map) never throws and kills the rest of the page's JS — that
+    // would make every button appear dead.
+    currentMessages = Array.isArray(data) ? data : [];
+    if (!Array.isArray(data)) {
+      console.error('[loadMessages] /api/messages did not return an array:', data);
+      showAlert && showAlert('messagesAlert', '⚠️ Could not load messages: ' + (data && data.error ? data.error : 'unexpected response'), 'error');
+    }
     displayMessages();
     // If the form isn't currently mid-edit (date not locked) and is empty,
     // pre-fill the suggested next date so a new entry is ready to go.
